@@ -38,15 +38,22 @@ PLANNED = {
     "batched_actions", "trajectory_recording", "custom_tools_registry", "ui_automation_tree",
     "browser_dom_adapter", "input_injecting_smoke_script", "nested_desktop",
 }
+# Toggles whose feature is not built yet (toggles wave 1 builds the rest).
+UNBUILT = {
+    "trajectory_recording", "custom_tools_registry", "ui_automation_tree",
+    "browser_dom_adapter", "input_injecting_smoke_script", "nested_desktop",
+}
 
 
 def test_planned_toggles_are_registered_off_and_hidden():
     for key in PLANNED:
         spec = rs.BY_KEY[key]
-        assert spec.kind == "bool" and spec.default is False and spec.available is False
+        assert spec.kind == "bool" and spec.default is False
+        assert spec.available is (key not in UNBUILT)
         assert spec.risk and spec.label
     shown = {s["key"] for s in rs.schema()}
-    assert not shown & PLANNED
+    assert not shown & UNBUILT
+    assert PLANNED - UNBUILT <= shown
     assert PLANNED <= {s["key"] for s in rs.schema(include_unavailable=True)}
     store = rs.SettingsStore("/nonexistent/never-written.json")
     ok, errors = store.update({"nested_desktop": True})

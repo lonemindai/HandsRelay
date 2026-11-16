@@ -36,7 +36,7 @@ from collections import OrderedDict
 from io import BytesIO
 
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, abort, jsonify, request
 
 # Stripped (review E9): cmd's `set NAME=value && ...` keeps the trailing
 # space, which made the token and secret silently never match.
@@ -1698,6 +1698,77 @@ def act():
     payload = {k: v for k, v in body.items() if k != "op"}
     status, result = _forward_act(op, payload)
     return jsonify(result), status
+
+
+# ---------------------------------------------------------------------------
+# Toggle: batched actions (WP3; partner ruling 2026-11-15 18:57, "toggle,
+# off by default"). Off: /v1/act/batch does not exist (404, the same
+# response as any unknown route). On: one request runs up to BATCH_MAX
+# acts in order through _forward_act, the same path /v1/act uses, so
+# pause, yield and the hands' guards apply to every act. The batch stops
+# at the first act the hands yields or refuses because the owner is
+# active, or the relay is paused; with stop_on_error (default true) it
+# also stops at any other failure. Set live by the app's settings
+# (gw.BATCHED_ACTIONS) or env HANDSRELAY_BATCHED_ACTIONS=1 standalone.
+# ---------------------------------------------------------------------------
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+BATCHED_ACTIONS = _env_flag("HANDSRELAY_BATCHED_ACTIONS")
+BATCH_MAX = 50
+
+
+def _owner_stop(status, result):
+    """True when the act did not run because the owner stepped in (or
+    paused the relay): the batch must not carry on past it."""
+    if status == 423 or _is_yield_conflict(status, result):
+        return True
+    return (
+        isinstance(result, dict)
+        and result.get("error_code") == "type_aborted"
+        and result.get("abort_reason") == "owner"
+    )
+
+
+@app.post("/v1/act/batch")
+def act_batch():
+    """{actions: [{op, ...params}, ...], stop_on_error?: true}."""
+    if not BATCHED_ACTIONS:
+        abort(404)
+    body = _json_body()
+    actions = body.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return jsonify({"ok": False, "error": "actions must be a non-empty list"}), 400
+    if len(actions) > BATCH_MAX:
+        return jsonify({"ok": False, "error": f"at most {BATCH_MAX} actions per batch"}), 400
+    if not all(isinstance(a, dict) for a in actions):
+        return jsonify({"ok": False, "error": "each action must be an object with an op"}), 400
+    stop_on_error = body.get("stop_on_error", True) is not False
+    results, stopped_at, reason = [], None, None
+    for index, action in enumerate(actions):
+        op = action.get("op") or ""
+        payload = {k: v for k, v in action.items() if k != "op"}
+        status, result = _forward_act(op, payload)
+        ok = isinstance(status, int) and 200 <= status < 300
+        results.append({"index": index, "op": _short(op), "status": status, "ok": ok, "result": result})
+        if _owner_stop(status, result):
+            stopped_at, reason = index, ("paused" if status == 423 else "owner")
+            break
+        if not ok and stop_on_error:
+            stopped_at, reason = index, "error"
+            break
+    completed = sum(1 for r in results if r["ok"])
+    return jsonify(
+        {
+            "ok": completed == len(actions),
+            "total": len(actions),
+            "completed": completed,
+            "stopped_at": stopped_at,
+            "stop_reason": reason,
+            "results": results,
+        }
+    )
 
 
 def _param_keys(payload, exclude=()):

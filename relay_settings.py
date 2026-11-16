@@ -119,9 +119,10 @@ _RULED = "partner ruling 2026-11-15 (toggle); feature not built yet"
 PLANNED_TOGGLES = (
     Setting(
         key="batched_actions", label="Let an agent send several actions in one request",
-        help="Faster multi-step work; the whole batch runs before you can step in.",
+        help="Adds POST /v1/act/batch (up to 50 acts in order). The batch stops when you take over or pause the relay.",
         risk="A batch can do several things before your input interrupts it.",
-        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+        kind="bool", default=False, applies="live", group="Agent capabilities",
+        source="partner ruling 2026-11-15 (toggle); services/gateway/app.py BATCHED_ACTIONS (env HANDSRELAY_BATCHED_ACTIONS)",
     ),
     Setting(
         key="trajectory_recording", label="Record what the agent does (screens and actions) to disk",

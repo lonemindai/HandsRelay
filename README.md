@@ -66,6 +66,22 @@ A damaged file is left in place, the app uses the defaults and shows a
 warning in the window. To add a setting, see the docstring at the top of
 `relay_settings.py`.
 
+### Agent-capability toggles (all off by default)
+
+Partner ruling 2026-11-15: risky capabilities ship as Settings switches,
+off by default; whoever turns one on owns the risk. Each switch shows its
+risk note. Safety guards (paste/focus guards, auth lockout) are not
+toggles.
+
+- **Batched actions** (`batched_actions`, live). Adds
+  `POST /v1/act/batch {"actions": [{"op": ...}, ...], "stop_on_error"?: true}`:
+  up to 50 acts run in order through the same path as `/v1/act`. The batch
+  stops at the first act refused because you are using the PC (yield) or
+  the relay is paused, and, with `stop_on_error`, at any other failure.
+  Answer: `{ok, total, completed, stopped_at, stop_reason, results[]}`.
+  Off: the route answers 404 exactly like an unknown route. Standalone
+  gateway: `HANDSRELAY_BATCHED_ACTIONS=1`.
+
 ## Quickstart (services)
 
 Docker is an option, never a requirement — both services are plain

@@ -913,6 +913,8 @@ class RelayApp:
                 gw.CLAIM_TTL_DEFAULT = values["claim_ttl_default_seconds"]
             if "queued_act_hold_seconds" in values:
                 gw.HOLD_DEFAULT = values["queued_act_hold_seconds"]
+            if "batched_actions" in values:
+                gw.BATCHED_ACTIONS = bool(values["batched_actions"])
         hands = self._hands_module
         if hands is not None and "paste_auto_min_chars" in values:
             hands.PASTE_AUTO_MIN_CHARS = values["paste_auto_min_chars"]
