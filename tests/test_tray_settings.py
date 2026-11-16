@@ -36,8 +36,10 @@ def _load(rel, tag):
 
 PLANNED = {
     "batched_actions", "trajectory_recording", "custom_tools_registry", "ui_automation_tree",
-    "browser_dom_adapter", "input_injecting_smoke_script", "nested_desktop",
+    "input_injecting_smoke_script", "nested_desktop",
 }
+# Built toggles: available, still default OFF with a risk note.
+BUILT_TOGGLES = {"browser_dom_adapter"}
 
 
 def test_planned_toggles_are_registered_off_and_hidden():
@@ -51,6 +53,10 @@ def test_planned_toggles_are_registered_off_and_hidden():
     store = rs.SettingsStore("/nonexistent/never-written.json")
     ok, errors = store.update({"nested_desktop": True})
     assert not ok and "not available" in errors[0]
+    for key in BUILT_TOGGLES:
+        spec = rs.BY_KEY[key]
+        assert spec.kind == "bool" and spec.default is False and spec.available is True and spec.risk
+        assert key in shown
 
 
 def test_defaults_equal_todays_behaviour():
