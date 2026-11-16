@@ -927,6 +927,10 @@ def click():
     }
 
 
+# "auto" typing pastes text longer than this (settings: paste_auto_min_chars).
+PASTE_AUTO_MIN_CHARS = 120
+
+
 def _type_dispatch(method, keys_fn, paste_fn, text):
     """Pick the type path; returns (method_used, note)."""
     if method == "keys":
@@ -936,7 +940,7 @@ def _type_dispatch(method, keys_fn, paste_fn, text):
             return paste_fn(), None
         except Exception as exc:
             return keys_fn(), f"paste requested but unavailable ({exc}); used keys"
-    if len(text) > 120 and _clipboard_backend() is not None:
+    if len(text) > PASTE_AUTO_MIN_CHARS and _clipboard_backend() is not None:
         try:
             return paste_fn(), None
         except Exception as exc:

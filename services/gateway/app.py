@@ -95,6 +95,12 @@ QUEUE_ENTRY_TTL = 3600
 HOLDER_MAX_CHARS = 128
 PURPOSE_MAX_CHARS = 500
 
+# Owner pause (tray "Pause relay", 2026-11-15): set only in-process by the
+# packaged app via set_paused(). While paused the claim is released, no
+# new claim is granted and no act is forwarded to the hands; /v1/info
+# reports "paused" so a driver can tell this from an outage.
+PAUSED = False
+
 _claim_lock = threading.RLock()
 _claim = None  # {"holder", "purpose", "since", "expires_at"} or None
 _claim_queue = []  # FIFO of {"holder", "purpose", "enqueued_at", "refreshed_at"}
@@ -307,6 +313,35 @@ def _queue_full_response(claim, reserved=None):
     if reserved is not None:
         body["reserved_for"] = reserved
     return jsonify(body), 409
+
+
+def set_paused(paused):
+    """Pause or resume the relay (owner action). Pausing releases the
+    current claim (pushed to the hands, so the resting hand lets go) and
+    drops any reservation; the waiting queue is kept for resume."""
+    global PAUSED, _claim, _reserved_for, _reserved_until
+    paused = bool(paused)
+    with _claim_lock:
+        released = None
+        if paused:
+            now = time.time()
+            current = _current_claim_locked(now)
+            if current is not None:
+                released = current["holder"]
+                _claim = None
+                _push_claim_locked(None, now)
+            _reserved_for = None
+            _reserved_until = 0.0
+        PAUSED = paused
+    if paused:
+        log_event("relay PAUSED by the owner" + (f" (released claim held by {released})" if released else ""))
+    else:
+        log_event("relay resumed by the owner")
+    return released
+
+
+def _paused_response():
+    return {"ok": False, "error": "relay paused by the owner", "error_code": "paused"}
 
 
 def _dequeue_locked(holder):
@@ -572,6 +607,7 @@ def info():
             "pc_state": pc_state,
             "watchers": _current_watchers(),
             "watcher_timeout_seconds": _watcher_timeout_setting(),
+            "paused": PAUSED,
         }
     )
 
@@ -640,6 +676,8 @@ def hands_claim():
         CLAIM_TTL_MAX,
     )
     want_queue = bool(body.get("queue"))
+    if PAUSED:
+        return jsonify(_paused_response()), 423
     now = time.time()
     with _claim_lock:
         current = _current_claim_locked(now)
@@ -1460,6 +1498,8 @@ def _forward_act(op, payload):
     This is exactly the forwarding /v1/act has always done, factored out
     so /v1/act/queued (and its retry pump) share the one code path.
     """
+    if PAUSED:
+        return 423, _paused_response()
     if not HANDS_SECRET:
         return 503, {"ok": False, "error": "HANDS_SECRET not configured on gateway"}
     # Review E6: a list/dict op used to raise TypeError (unhashable) -> 500.
