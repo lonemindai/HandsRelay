@@ -160,9 +160,10 @@ PLANNED_TOGGLES = (
     ),
     Setting(
         key="input_injecting_smoke_script", label="Allow the self-test that moves the mouse and types",
-        help="A smoke test that really injects input to prove the hands work.",
+        help="Lets tools/smoke_inject.py run: it moves the pointer and, if you name a window, types a marker into it.",
         risk="It moves the pointer and types while it runs.",
-        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+        kind="bool", default=False, applies="live", group="Agent capabilities",
+        source="partner ruling 2026-11-15 (toggle); tools/smoke_inject.py reads it from settings.json",
     ),
     Setting(
         key="nested_desktop", label="Run the agent on a separate (nested) desktop",

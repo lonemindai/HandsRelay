@@ -96,6 +96,13 @@ toggles.
   `HANDSRELAY_TRAJECTORY_RECORDING=1`, `HANDSRELAY_TRAJECTORY_TYPED_TEXT=1`,
   `HANDSRELAY_TRAJECTORY_DIR`.
 
+- **Input-injecting smoke test** (`input_injecting_smoke_script`).
+  `python tools/smoke_inject.py [--type-into Notepad]` refuses (exit 2)
+  unless this switch is on. It checks health and info, claims the hands
+  as `smoke-test`, moves the pointer twice and, with `--type-into`, focuses
+  that window and types a marker with `expect_focus` pinned to it, then
+  always releases the claim. **Risk: it moves the pointer and types.**
+
 ## Quickstart (services)
 
 Docker is an option, never a requirement — both services are plain
