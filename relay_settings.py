@@ -138,8 +138,9 @@ PLANNED_TOGGLES = (
     Setting(
         key="ui_automation_tree", label="Let agents read the Windows UI Automation tree",
         help="Agents can see buttons and fields by name instead of only by screenshot.",
-        risk="Exposes the text and structure of every open window.",
-        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+        risk="Exposes the text and structure of the window in front (names, fields, labels) to the agent, and lets it click or focus those elements.",
+        kind="bool", default=False, applies="live", group="Agent capabilities", available=True,
+        source="partner ruling 2026-11-15 (toggle); built: hands/uia.py, /v1/uia/tree and /v1/uia/act",
     ),
     Setting(
         key="browser_dom_adapter", label="Let agents read and drive web pages through the browser's page structure",

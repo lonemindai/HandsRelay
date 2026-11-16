@@ -864,6 +864,14 @@ class RelayApp:
         hands = self._hands_module
         if hands is not None and "paste_auto_min_chars" in values:
             hands.PASTE_AUTO_MIN_CHARS = values["paste_auto_min_chars"]
+        if "ui_automation_tree" in values:
+            on = bool(values["ui_automation_tree"])
+            os.environ["RELAY_UIA_TREE"] = "1" if on else "0"
+            os.environ["HANDS_UIA_TREE"] = "1" if on else "0"
+            if gw is not None:
+                gw.UIA_TREE_ENABLED = on
+            if hands is not None:
+                hands.UIA_TREE_ENABLED = on
 
     # ---------- helpers ----------
     def _stamp(self):

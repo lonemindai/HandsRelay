@@ -35,7 +35,7 @@ def _load(rel, tag):
 # ------------------------------------------------------------ settings store
 
 PLANNED = {
-    "batched_actions", "trajectory_recording", "custom_tools_registry", "ui_automation_tree",
+    "batched_actions", "trajectory_recording", "custom_tools_registry",
     "browser_dom_adapter", "input_injecting_smoke_script", "nested_desktop",
 }
 
@@ -54,7 +54,9 @@ def test_planned_toggles_are_registered_off_and_hidden():
 
 
 def test_defaults_equal_todays_behaviour():
-    d = {k: v for k, v in rs.defaults().items() if k not in PLANNED}
+    # Built toggles (default off) are covered by their own suites.
+    built = {"ui_automation_tree"}
+    d = {k: v for k, v in rs.defaults().items() if k not in PLANNED | built}
     assert d == {
         "owner_yield_idle_seconds": 5,
         "claim_ttl_default_seconds": 900,
