@@ -141,10 +141,12 @@ PLANNED_TOGGLES = (
         source="sub-option proposed with trajectory recording (toggles wave 1); services/gateway/app.py TRAJECTORY_TYPED_TEXT",
     ),
     Setting(
-        key="custom_tools_registry", label="Let agents register and run custom tools",
-        help="Agents can add their own named tools to the relay.",
+        key="custom_tools_registry", label="Let agents run the custom tools I declare",
+        help="Agents may list and run the programs you name in %USERPROFILE%\\.HandsRelayV0.1\\tools.json. "
+             "Agents cannot add tools, and nothing is downloaded.",
         risk="A custom tool runs whatever its author wrote, on this PC.",
-        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+        kind="bool", default=False, applies="live", group="Agent capabilities",
+        source="partner ruling 2026-11-15 (toggle); services/gateway/app.py CUSTOM_TOOLS (env HANDSRELAY_CUSTOM_TOOLS)",
     ),
     Setting(
         key="ui_automation_tree", label="Let agents read the Windows UI Automation tree",

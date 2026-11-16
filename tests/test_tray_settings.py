@@ -41,7 +41,7 @@ PLANNED = {
 }
 # Toggles whose feature is not built yet (toggles wave 1 builds the rest).
 UNBUILT = {
-    "custom_tools_registry", "ui_automation_tree",
+    "ui_automation_tree",
     "browser_dom_adapter", "nested_desktop",
 }
 

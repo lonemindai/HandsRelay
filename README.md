@@ -103,6 +103,19 @@ toggles.
   that window and types a marker with `expect_focus` pinned to it, then
   always releases the claim. **Risk: it moves the pointer and types.**
 
+- **Custom tools** (`custom_tools_registry`, live). Agents may list
+  (`GET /v1/tools`) and run (`POST /v1/tools/<name>/run {"args"?: [...]}`)
+  only the programs **you** declare in
+  `%USERPROFILE%\.HandsRelayV0.1\tools.json`:
+  `{"version": 1, "tools": [{"name": "build", "description": "...",
+  "command": ["C:\\tools\\build.bat"], "cwd": "C:\\src",
+  "timeout_seconds": 30, "allow_args": false}]}`. Agents cannot add tools;
+  nothing is downloaded; the file is re-read on every request. A run is
+  `command` (+ `args` if `allow_args`) with no shell, stdin closed, output
+  capped at 64 KB, refused while the relay is paused. **Risk: a custom tool
+  runs whatever its author wrote, on this PC.** Off: both routes are 404.
+  Standalone gateway: `HANDSRELAY_CUSTOM_TOOLS=1`, `HANDSRELAY_TOOLS_FILE`.
+
 ## Quickstart (services)
 
 Docker is an option, never a requirement — both services are plain

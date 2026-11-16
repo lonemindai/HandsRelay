@@ -30,6 +30,7 @@ import json
 import math
 import os
 import queue as _queue_mod
+import subprocess
 import threading
 import time
 import uuid
@@ -1871,6 +1872,153 @@ def act_batch():
             "results": results,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Toggle: custom-tools registry (WP2; partner ruling 2026-11-15 18:57,
+# "toggle, off by default"). Off: /v1/tools and /v1/tools/<name>/run do
+# not exist (404, like any unknown route). On: agents may LIST and RUN
+# the tools the owner declared in a local JSON file (default
+# %USERPROFILE%\.HandsRelayV0.1\tools.json, env HANDSRELAY_TOOLS_FILE).
+# Agents cannot register tools; nothing is ever fetched from the network.
+# The file is re-read on every request, so edits apply at once. Format:
+#   {"version": 1, "tools": [{"name": "build", "description": "...",
+#     "command": ["C:\\tools\\build.bat", "--quick"], "cwd": "C:\\src",
+#     "timeout_seconds": 30, "allow_args": false}]}
+# A run is subprocess.run(command [+ args], shell=False), stdin closed,
+# stdout/stderr capped at TOOL_OUTPUT_MAX bytes each. Pausing the relay
+# refuses runs (423) like every act. Invalid entries are skipped with a
+# warning shown in GET /v1/tools.
+# ---------------------------------------------------------------------------
+CUSTOM_TOOLS = _env_flag("HANDSRELAY_CUSTOM_TOOLS")
+TOOLS_FILE = os.environ.get("HANDSRELAY_TOOLS_FILE", "").strip() or os.path.join(
+    os.path.expanduser("~"), ".HandsRelayV0.1", "tools.json"
+)
+TOOL_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+TOOL_TIMEOUT_DEFAULT = 30
+TOOL_TIMEOUT_MAX = 600
+TOOL_ARGS_MAX = 16
+TOOL_ARG_CHARS_MAX = 4096
+TOOL_OUTPUT_MAX = 64 * 1024
+TOOLS_MAX = 64
+
+
+def _load_tools(path=None):
+    """(tools by name, warnings). Never raises."""
+    path = path or TOOLS_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return {}, [f"no tools file at {path}"]
+    except (OSError, ValueError) as exc:
+        return {}, [f"tools file could not be read ({exc.__class__.__name__})"]
+    if not isinstance(doc, dict) or doc.get("version") != 1 or not isinstance(doc.get("tools"), list):
+        return {}, ['tools file must be {"version": 1, "tools": [...]}']
+    tools, warnings = {}, []
+    for index, raw in enumerate(doc["tools"][:TOOLS_MAX]):
+        where = f"tool #{index + 1}"
+        if not isinstance(raw, dict):
+            warnings.append(f"{where}: not an object; skipped")
+            continue
+        name = raw.get("name")
+        if not isinstance(name, str) or not (1 <= len(name) <= 40) or not set(name) <= TOOL_NAME_CHARS:
+            warnings.append(f"{where}: name must be 1-40 of a-z 0-9 _ -; skipped")
+            continue
+        command = raw.get("command")
+        if not isinstance(command, list) or not command or not all(isinstance(c, str) and c for c in command):
+            warnings.append(f"{name}: command must be a non-empty list of strings; skipped")
+            continue
+        cwd = raw.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            warnings.append(f"{name}: cwd must be a string; skipped")
+            continue
+        timeout = raw.get("timeout_seconds", TOOL_TIMEOUT_DEFAULT)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not (1 <= timeout <= TOOL_TIMEOUT_MAX):
+            warnings.append(f"{name}: timeout_seconds must be 1-{TOOL_TIMEOUT_MAX}; skipped")
+            continue
+        if name in tools:
+            warnings.append(f"{name}: declared twice; the first is used")
+            continue
+        tools[name] = {
+            "name": name,
+            "description": str(raw.get("description") or "")[:300],
+            "command": list(command),
+            "cwd": cwd,
+            "timeout_seconds": timeout,
+            "allow_args": raw.get("allow_args") is True,
+        }
+    return tools, warnings
+
+
+def _cap_output(data):
+    data = data or b""
+    text = data[:TOOL_OUTPUT_MAX].decode("utf-8", errors="replace")
+    return text, len(data) > TOOL_OUTPUT_MAX
+
+
+def _run_tool(tool, args, run=subprocess.run):
+    started = time.monotonic()
+    try:
+        proc = run(
+            tool["command"] + list(args),
+            cwd=tool["cwd"],
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=tool["timeout_seconds"],
+        )
+    except subprocess.TimeoutExpired as exc:
+        out, out_cut = _cap_output(exc.stdout)
+        err, err_cut = _cap_output(exc.stderr)
+        return {"ok": False, "timed_out": True, "exit_code": None, "stdout": out, "stderr": err,
+                "truncated": out_cut or err_cut, "duration_s": round(time.monotonic() - started, 3)}
+    except OSError as exc:
+        return {"ok": False, "timed_out": False, "exit_code": None, "stdout": "", "stderr": "",
+                "truncated": False, "error": f"could not start: {exc.__class__.__name__}: {exc}"[:300],
+                "duration_s": round(time.monotonic() - started, 3)}
+    out, out_cut = _cap_output(proc.stdout)
+    err, err_cut = _cap_output(proc.stderr)
+    return {"ok": proc.returncode == 0, "timed_out": False, "exit_code": proc.returncode, "stdout": out,
+            "stderr": err, "truncated": out_cut or err_cut, "duration_s": round(time.monotonic() - started, 3)}
+
+
+@app.get("/v1/tools")
+def tools_list():
+    if not CUSTOM_TOOLS:
+        abort(404)
+    tools, warnings = _load_tools()
+    public = [
+        {k: t[k] for k in ("name", "description", "allow_args", "timeout_seconds")}
+        for t in tools.values()
+    ]
+    return jsonify({"ok": True, "tools": public, "warnings": warnings})
+
+
+@app.post("/v1/tools/<name>/run")
+def tools_run(name):
+    """{args?: [str]}: run one owner-declared tool."""
+    if not CUSTOM_TOOLS:
+        abort(404)
+    if PAUSED:
+        return jsonify(_paused_response()), 423
+    tools, _ = _load_tools()
+    tool = tools.get(name)
+    if tool is None:
+        return jsonify({"ok": False, "error": f"no tool named {_short(name)!r} in the tools file"}), 404
+    args = _json_body().get("args", [])
+    if args and not tool["allow_args"]:
+        return jsonify({"ok": False, "error": "this tool does not accept args (allow_args is false)"}), 400
+    if not isinstance(args, list) or len(args) > TOOL_ARGS_MAX or not all(
+        isinstance(a, str) and len(a) <= TOOL_ARG_CHARS_MAX for a in args
+    ):
+        return jsonify({"ok": False, "error": f"args must be a list of at most {TOOL_ARGS_MAX} strings"}), 400
+    result = _run_tool(tool, args)
+    log_event(f"custom tool '{name}' ran: exit {result.get('exit_code')}" + (" (timed out)" if result["timed_out"] else ""))
+    if TRAJECTORY_RECORDING:
+        _trajectory_record(f"tool:{name}", {"args": {"redacted": True, "count": len(args)}},
+                           200, {"error_code": None if result["ok"] else "tool_failed"})
+    return jsonify(dict(result, tool=name))
 
 
 def _param_keys(payload, exclude=()):
