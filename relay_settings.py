@@ -126,7 +126,7 @@ PLANNED_TOGGLES = (
     Setting(
         key="trajectory_recording", label="Record what the agent does (screens and actions) to disk",
         help="Keeps a replayable record of agent sessions.",
-        risk="Recordings may hold anything on screen, including private data.",
+        risk="Recordings keep everything on screen and every typed text, passwords included.",
         kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
     ),
     Setting(
