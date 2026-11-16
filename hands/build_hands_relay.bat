@@ -31,10 +31,10 @@ echo Building HandsRelay.exe ...
 rem motion.py is loaded by path at runtime: bundle it under hands\ inside
 rem the exe, where _load_motion() looks for it.
 if exist muse.ico (
-    python -m PyInstaller --onefile --noconsole --name "HandsRelay" --icon muse.ico --add-data "muse.ico;." --add-data "motion.py;hands" hands_relay_hands.py
+    python -m PyInstaller --onefile --noconsole --name "HandsRelay" --icon muse.ico --add-data "muse.ico;." --add-data "motion.py;hands" --add-data "uia.py;hands" hands_relay_hands.py
 ) else (
     echo muse.ico not found - building without a custom icon.
-    python -m PyInstaller --onefile --noconsole --name "HandsRelay" --add-data "motion.py;hands" hands_relay_hands.py
+    python -m PyInstaller --onefile --noconsole --name "HandsRelay" --add-data "motion.py;hands" --add-data "uia.py;hands" hands_relay_hands.py
 )
 if errorlevel 1 goto :fail
 

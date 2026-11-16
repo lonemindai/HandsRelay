@@ -70,6 +70,14 @@ try:  # Optional (review E1): richer /windows (process names) when installed.
 except ImportError:  # focus and the hwnd pin work without it (ctypes)
     pass
 
+try:  # Optional: the opt-in UI Automation tree (hands/uia.py) uses it;
+    # imported here only so PyInstaller bundles it. Without it that
+    # setting answers "uia_unavailable".
+    import comtypes  # noqa: F401
+    import comtypes.client  # noqa: F401
+except Exception:
+    pass
+
 HANDS_PORT = 5000
 GATEWAY_PORT = 5010
 PARSER_PORT = 5011

@@ -66,6 +66,32 @@ A damaged file is left in place, the app uses the defaults and shows a
 warning in the window. To add a setting, see the docstring at the top of
 `relay_settings.py`.
 
+## UI Automation tree (opt-in, default off)
+
+Settings → Agent capabilities → "Let agents read the Windows UI
+Automation tree". **Risk:** the agent can read the names, fields and
+labels of the window in front and click or focus them. Off (the
+default): both routes answer `403 {"error_code": "uia_disabled"}` and
+nothing else changes. Needs the optional `comtypes` package (MIT;
+`build_app.bat` installs it), else `501 uia_unavailable`. Running the
+services yourself: `RELAY_UIA_TREE=1` (gateway) and `HANDS_UIA_TREE=1`
+(hands); both must be on.
+
+- `GET /v1/uia/tree?max_depth=6&max_nodes=400` — the FOREGROUND window
+  only. Returns `snapshot` (a token, valid 120 s), `window`, `truncated`
+  and `nodes: [{id, depth, name, control_type, rect{x,y,w,h}, enabled,
+  focused, automation_id}]`. `id` is the child path (`"0.2.1"`). Depth
+  is capped at 20, nodes at 2000, names at 200 characters. Reading does
+  not wait for you to stop using the PC (it injects nothing).
+- `POST /v1/uia/act {"snapshot", "id", "action": "click"|"focus",
+  "button"?, "human"?, "expect_focus"?}` — click re-reads the element's
+  live rectangle and clicks it through the normal `/click` (human motion
+  inside the element's box); focus uses UIA SetFocus. Like every act it
+  yields while you are active (409), refuses on a locked desktop, honours
+  `expect_focus`, and is refused while the relay is paused (423). A
+  stale snapshot or vanished element answers `409 uia_stale`: read the
+  tree again. The hands claim stays advisory, as for `/v1/act`.
+
 ## Quickstart (services)
 
 Docker is an option, never a requirement — both services are plain
