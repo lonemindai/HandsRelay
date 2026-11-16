@@ -69,6 +69,7 @@ def test_defaults_equal_todays_behaviour():
         "paste_auto_min_chars": 120,
         "close_to_tray": False,
         "tray_icon": True,
+        "browser_dom_adapter": False,  # built toggle: off = no DOM routes, today's behaviour
     }
     assert rs.changed_from_defaults(d) == {}
 

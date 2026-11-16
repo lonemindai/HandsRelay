@@ -66,6 +66,34 @@ A damaged file is left in place, the app uses the defaults and shows a
 warning in the window. To add a setting, see the docstring at the top of
 `relay_settings.py`.
 
+## Browser DOM adapter (opt-in, default off)
+
+Settings -> Agent capabilities -> "Let agents read and drive web pages through the browser's page
+structure". Off by default; while off, every `/v1/dom/*` route answers **403
+`error_code: dom_adapter_off`** and the rest of the gateway is unchanged.
+
+The relay **never starts your browser**. To allow it, start a Chromium-family browser yourself
+with remote debugging, ideally in a separate profile:
+
+    msedge.exe --remote-debugging-port=9222 --user-data-dir=%TEMP%\relay-browser
+
+The adapter connects only to `127.0.0.1` (port from `RELAY_DOM_CDP_PORT`, default 9222) and refuses
+any tab whose debugger URL points elsewhere. Stdlib only (no new dependency).
+
+| Route | Body | Notes |
+|---|---|---|
+| `GET /v1/dom/tabs` | | page tabs: `{id, title, url}` |
+| `POST /v1/dom/snapshot` | `tab_id`, `max_chars`? (1000-200000, default 20000), `include_values`? (JSON `true` only) | compact node list `{d, tag, sel, role?, name?, text?, href?, type?, value?, checked?, hidden?}`; form values `[REDACTED]` by default, passwords `[REDACTED:password]` always; `truncated` when capped |
+| `POST /v1/dom/act` | `holder`, `tab_id`, `op`: `click`\|`type`, `selector` (CSS), `text` (type) | click = real mouse press/release at the element centre; type = focus + insert text |
+
+Gating: Pause -> 423 `paused` (reads and acts). Acts also need the caller to **hold the hands
+claim** (409 `claim_required`) and the owner idle past the give-way threshold (409 `yield`; 503
+`owner_state_unknown` when the hands cannot report it). No browser -> 503 `no_browser` with how to
+start one.
+
+**Risk:** a browser session is your signed-in accounts. With this on, an agent holding the token can
+read those pages and click and type in them. Use a dedicated profile for agent work.
+
 ## Quickstart (services)
 
 Docker is an option, never a requirement — both services are plain
