@@ -34,8 +34,27 @@ def _load(rel, tag):
 
 # ------------------------------------------------------------ settings store
 
+PLANNED = {
+    "batched_actions", "trajectory_recording", "custom_tools_registry", "ui_automation_tree",
+    "browser_dom_adapter", "input_injecting_smoke_script", "nested_desktop",
+}
+
+
+def test_planned_toggles_are_registered_off_and_hidden():
+    for key in PLANNED:
+        spec = rs.BY_KEY[key]
+        assert spec.kind == "bool" and spec.default is False and spec.available is False
+        assert spec.risk and spec.label
+    shown = {s["key"] for s in rs.schema()}
+    assert not shown & PLANNED
+    assert PLANNED <= {s["key"] for s in rs.schema(include_unavailable=True)}
+    store = rs.SettingsStore("/nonexistent/never-written.json")
+    ok, errors = store.update({"nested_desktop": True})
+    assert not ok and "not available" in errors[0]
+
+
 def test_defaults_equal_todays_behaviour():
-    d = rs.defaults()
+    d = {k: v for k, v in rs.defaults().items() if k not in PLANNED}
     assert d == {
         "owner_yield_idle_seconds": 5,
         "claim_ttl_default_seconds": 900,
@@ -144,7 +163,7 @@ def test_update_rejects_bad_values_and_writes_nothing(tmp_path):
 def test_schema_is_json_safe_and_complete():
     schema = rs.schema()
     json.dumps(schema)
-    assert [s["key"] for s in schema] == [s.key for s in rs.SETTINGS]
+    assert [s["key"] for s in schema] == [s.key for s in rs.SETTINGS if s.available]
 
 
 # ------------------------------------------------------------ tray mapping

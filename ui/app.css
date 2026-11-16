@@ -339,3 +339,4 @@ body:not([data-phase="idle"]) .banner.banner-warn:not([hidden]) { display: block
 .setting-help { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
 .setting input[type="number"] { width: 96px; }
 .settings-warn { color: var(--bad, #ff5c6c); margin: 8px 0; }
+.setting-risk { color: var(--warn); }

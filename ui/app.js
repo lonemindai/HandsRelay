@@ -386,6 +386,12 @@
       const when = s.applies === "live" ? "Applies when saved." : "Applies on the next Start.";
       help.textContent = `${s.help} Default: ${s.kind === "bool" ? (s.default ? "on" : "off") : s.default}. ${when}`;
       row.append(label, input, help);
+      if (s.risk) {
+        const risk = document.createElement("span");
+        risk.className = "setting-help setting-risk";
+        risk.textContent = `Risk: ${s.risk}`;
+        row.appendChild(risk);
+      }
       form.appendChild(row);
     }
     const warn = $("settings-modal-warn");

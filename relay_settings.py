@@ -21,7 +21,11 @@ one Setting(...) to SETTINGS below with a plain-language label and a
 default equal to today's behaviour, then read it where the behaviour
 lives (relay.settings.get(key), or an APPLY entry for a module
 constant / env var). The panel renders straight from SETTINGS, so no
-UI change is needed. Bump SCHEMA_VERSION only when an existing key
+UI change is needed. A ruled toggle whose feature is not built yet is
+registered with available=False (and default False, a risk note): it
+is kept in the schema and in a saved file, but the panel does not show
+it, because a switch that does nothing is worse than none. Flip
+available=True in the same commit that builds the feature. Bump SCHEMA_VERSION only when an existing key
 changes meaning; adding keys does not need a bump.
 """
 
@@ -49,6 +53,9 @@ class Setting:
     group: str = "Relay"
     # Where today's behaviour lives (inventory, for the report/readers).
     source: str = ""
+    # False: the feature is not built; the panel hides the switch.
+    available: bool = True
+    risk: str = ""  # shown under the switch for risky capabilities
     extra: dict = field(default_factory=dict)
 
 
@@ -103,6 +110,57 @@ SETTINGS = (
         source="new with this ticket (no tray existed before)",
     ),
 )
+
+# Partner toggle rulings, 2026-11-15 18:57 CST (BOARD 19:00:00, "we
+# shouldn't babysit how people use the app"): risky capabilities ship as
+# toggles, default OFF. None of these features exists yet, so all are
+# available=False until their own build lands.
+_RULED = "partner ruling 2026-11-15 (toggle); feature not built yet"
+PLANNED_TOGGLES = (
+    Setting(
+        key="batched_actions", label="Let an agent send several actions in one request",
+        help="Faster multi-step work; the whole batch runs before you can step in.",
+        risk="A batch can do several things before your input interrupts it.",
+        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+    ),
+    Setting(
+        key="trajectory_recording", label="Record what the agent does (screens and actions) to disk",
+        help="Keeps a replayable record of agent sessions.",
+        risk="Recordings may hold anything on screen, including private data.",
+        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+    ),
+    Setting(
+        key="custom_tools_registry", label="Let agents register and run custom tools",
+        help="Agents can add their own named tools to the relay.",
+        risk="A custom tool runs whatever its author wrote, on this PC.",
+        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+    ),
+    Setting(
+        key="ui_automation_tree", label="Let agents read the Windows UI Automation tree",
+        help="Agents can see buttons and fields by name instead of only by screenshot.",
+        risk="Exposes the text and structure of every open window.",
+        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+    ),
+    Setting(
+        key="browser_dom_adapter", label="Let agents read and drive web pages through the browser's page structure",
+        help="Works with any model driving the relay, not only Muse.",
+        risk="Page contents, including signed-in sites, become readable to the agent.",
+        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+    ),
+    Setting(
+        key="input_injecting_smoke_script", label="Allow the self-test that moves the mouse and types",
+        help="A smoke test that really injects input to prove the hands work.",
+        risk="It moves the pointer and types while it runs.",
+        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+    ),
+    Setting(
+        key="nested_desktop", label="Run the agent on a separate (nested) desktop",
+        help="Optional mode: the agent works on its own desktop instead of yours.",
+        risk="Experimental mode; see docs/SPIKE-NESTED-DESKTOP.md.",
+        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+    ),
+)
+SETTINGS = SETTINGS + PLANNED_TOGGLES
 
 BY_KEY = {s.key: s for s in SETTINGS}
 
@@ -176,15 +234,18 @@ def changed_from_defaults(values):
     return {k: v for k, v in values.items() if k in BY_KEY and v != BY_KEY[k].default}
 
 
-def schema():
-    """The panel's view of SETTINGS (JSON-safe)."""
+def schema(include_unavailable=False):
+    """The panel's view of SETTINGS (JSON-safe); only built features
+    unless include_unavailable."""
     return [
         {
             "key": s.key, "label": s.label, "help": s.help, "kind": s.kind,
             "default": s.default, "min": s.min, "max": s.max,
-            "applies": s.applies, "group": s.group,
+            "applies": s.applies, "group": s.group, "risk": s.risk,
+            "available": s.available,
         }
         for s in SETTINGS
+        if s.available or include_unavailable
     ]
 
 
@@ -221,6 +282,9 @@ class SettingsStore:
             spec = BY_KEY.get(key)
             if spec is None:
                 errors.append(f"unknown setting '{key}'")
+                continue
+            if not spec.available:
+                errors.append(f"'{key}' is not available yet (its feature is not built)")
                 continue
             ok, value = validate_value(spec, raw)
             if not ok:
