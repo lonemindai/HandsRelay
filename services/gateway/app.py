@@ -101,6 +101,13 @@ PURPOSE_MAX_CHARS = 500
 # reports "paused" so a driver can tell this from an outage.
 PAUSED = False
 
+# Opt-in UI Automation tree (settings key ui_automation_tree; partner
+# ruling 2026-11-15: TOGGLE, default OFF). Set in-process by the packaged
+# app, or RELAY_UIA_TREE=1. While off, /v1/uia/* answer 403
+# error_code "uia_disabled" and never reach the hands; every other route
+# is unchanged.
+UIA_TREE_ENABLED = os.environ.get("RELAY_UIA_TREE", "").strip() == "1"
+
 _claim_lock = threading.RLock()
 _claim = None  # {"holder", "purpose", "since", "expires_at"} or None
 _claim_queue = []  # FIFO of {"holder", "purpose", "enqueued_at", "refreshed_at"}
@@ -1492,20 +1499,23 @@ def stop_background(timeout=2.0):
         thread.join(timeout)
 
 
-def _forward_act(op, payload):
+def _forward_act(op, payload, path=None):
     """Forward one act to the hands. Returns (status_code, json_dict).
 
     This is exactly the forwarding /v1/act has always done, factored out
     so /v1/act/queued (and its retry pump) share the one code path.
+    path: an explicit hands route for a non-/v1/act caller (/v1/uia/act);
+    it skips the HANDS_OPS check, nothing else.
     """
     if PAUSED:
         return 423, _paused_response()
     if not HANDS_SECRET:
         return 503, {"ok": False, "error": "HANDS_SECRET not configured on gateway"}
-    # Review E6: a list/dict op used to raise TypeError (unhashable) -> 500.
-    if not isinstance(op, str) or op not in HANDS_OPS:
-        return 400, {"ok": False, "error": f"unknown op: {_short(op)!r}"}
-    path = HANDS_OP_PATHS.get(op, op)
+    if path is None:
+        # Review E6: a list/dict op used to raise TypeError (unhashable) -> 500.
+        if not isinstance(op, str) or op not in HANDS_OPS:
+            return 400, {"ok": False, "error": f"unknown op: {_short(op)!r}"}
+        path = HANDS_OP_PATHS.get(op, op)
     try:
         r = requests.post(
             f"{HANDS_URL}/{path}",
@@ -1569,6 +1579,56 @@ def _proxy_hands_get(path):
         return jsonify(r.json()), r.status_code
     except ValueError:
         return jsonify({"ok": r.ok, "status": r.status_code}), r.status_code
+
+
+def _uia_disabled_response():
+    return {
+        "ok": False,
+        "error": "UI Automation tree is off (Settings: 'Let agents read the Windows UI Automation tree')",
+        "error_code": "uia_disabled",
+    }
+
+
+@app.get("/v1/uia/tree")
+def uia_tree():
+    """Opt-in: the foreground window's UI Automation tree, proxied.
+
+    Query: max_depth (default 6, max 20), max_nodes (default 400, max
+    2000). Returns {snapshot, nodes:[{id, depth, name, control_type,
+    rect, enabled, focused, automation_id}], truncated, window}.
+    403 uia_disabled when the toggle is off; 423 paused while paused.
+    """
+    if not UIA_TREE_ENABLED:
+        return jsonify(_uia_disabled_response()), 403
+    if PAUSED:
+        return jsonify(_paused_response()), 423
+    qs = {}
+    for key in ("max_depth", "max_nodes"):
+        value = request.args.get(key)
+        if value is not None:
+            qs[key] = _short(value, 8)
+    path = "/uia/tree"
+    if qs:
+        path += "?" + "&".join(f"{k}={requests.utils.quote(v)}" for k, v in qs.items())
+    return _proxy_hands_get(path)
+
+
+@app.post("/v1/uia/act")
+def uia_act():
+    """Opt-in: {snapshot, id, action: "click"|"focus", button?, human?,
+    expect_focus?} on an element from /v1/uia/tree. Same forwarding as
+    /v1/act (owner pause 423; the hands' owner yield 409 and focus guard
+    apply). The claim stays advisory, exactly as for /v1/act."""
+    if not UIA_TREE_ENABLED:
+        return jsonify(_uia_disabled_response()), 403
+    body = _json_body()
+    payload = {
+        k: body[k]
+        for k in ("snapshot", "id", "action", "button", "human", "expect_focus")
+        if k in body
+    }
+    status, result = _forward_act("uia_act", payload, path="uia/act")
+    return jsonify(result), status
 
 
 @app.get("/v1/windows")
