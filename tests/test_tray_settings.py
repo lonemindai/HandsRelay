@@ -37,10 +37,11 @@ def _load(rel, tag):
 PLANNED = {
     "batched_actions", "trajectory_recording", "custom_tools_registry", "ui_automation_tree",
     "browser_dom_adapter", "input_injecting_smoke_script", "nested_desktop",
+    "trajectory_record_typed_text",
 }
 # Toggles whose feature is not built yet (toggles wave 1 builds the rest).
 UNBUILT = {
-    "trajectory_recording", "custom_tools_registry", "ui_automation_tree",
+    "custom_tools_registry", "ui_automation_tree",
     "browser_dom_adapter", "input_injecting_smoke_script", "nested_desktop",
 }
 

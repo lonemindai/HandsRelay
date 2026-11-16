@@ -915,6 +915,10 @@ class RelayApp:
                 gw.HOLD_DEFAULT = values["queued_act_hold_seconds"]
             if "batched_actions" in values:
                 gw.BATCHED_ACTIONS = bool(values["batched_actions"])
+            if "trajectory_recording" in values:
+                gw.TRAJECTORY_RECORDING = bool(values["trajectory_recording"])
+            if "trajectory_record_typed_text" in values:
+                gw.TRAJECTORY_TYPED_TEXT = bool(values["trajectory_record_typed_text"])
         hands = self._hands_module
         if hands is not None and "paste_auto_min_chars" in values:
             hands.PASTE_AUTO_MIN_CHARS = values["paste_auto_min_chars"]

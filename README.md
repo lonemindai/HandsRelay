@@ -82,6 +82,20 @@ toggles.
   Off: the route answers 404 exactly like an unknown route. Standalone
   gateway: `HANDSRELAY_BATCHED_ACTIONS=1`.
 
+- **Trajectory recording** (`trajectory_recording`, live). Every act
+  forwarded to the hands (by `/v1/act`, `/v1/act/queued` and its retries,
+  `/v1/act/batch`) is appended to
+  `%USERPROFILE%\.HandsRelayV0.1\trajectories\<YYYYMMDD>\actions.jsonl`
+  and every screenshot served by `/v1/screen` is saved beside it as
+  `screen-<ms>.png`. Local folder only; nothing is uploaded. **Risk:
+  recordings keep everything on screen.** Typed text (`text` of `type` /
+  `clipboard_set`) is stored as its length only unless the second switch
+  **Also keep the text the agent types** (`trajectory_record_typed_text`)
+  is on; then passwords and anything else typed are saved in plain text.
+  Key and hotkey names are always kept. Standalone gateway:
+  `HANDSRELAY_TRAJECTORY_RECORDING=1`, `HANDSRELAY_TRAJECTORY_TYPED_TEXT=1`,
+  `HANDSRELAY_TRAJECTORY_DIR`.
+
 ## Quickstart (services)
 
 Docker is an option, never a requirement — both services are plain

@@ -126,9 +126,19 @@ PLANNED_TOGGLES = (
     ),
     Setting(
         key="trajectory_recording", label="Record what the agent does (screens and actions) to disk",
-        help="Keeps a replayable record of agent sessions.",
+        help="Saves every agent action and every screenshot it takes to a local folder "
+             "(%USERPROFILE%\\.HandsRelayV0.1\\trajectories). Nothing is uploaded. Typed text is "
+             "blanked out unless you also turn on the next switch.",
         risk="Recordings keep everything on screen and every typed text, passwords included.",
-        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+        kind="bool", default=False, applies="live", group="Agent capabilities",
+        source="partner ruling 2026-11-15 (toggle); services/gateway/app.py TRAJECTORY_RECORDING (env HANDSRELAY_TRAJECTORY_RECORDING)",
+    ),
+    Setting(
+        key="trajectory_record_typed_text", label="Also keep the text the agent types in recordings",
+        help="Only matters while recording is on. Off: typed text is saved as its length only.",
+        risk="Typed text often includes passwords, card numbers and private messages; they are saved in plain text.",
+        kind="bool", default=False, applies="live", group="Agent capabilities",
+        source="sub-option proposed with trajectory recording (toggles wave 1); services/gateway/app.py TRAJECTORY_TYPED_TEXT",
     ),
     Setting(
         key="custom_tools_registry", label="Let agents register and run custom tools",

@@ -26,6 +26,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import json
 import math
 import os
 import queue as _queue_mod
@@ -447,6 +448,10 @@ def _reset_coordination_state():
         _watcher_timeout = None
     with _frame_hash_cache_lock:
         _frame_hash_cache.clear()
+
+
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 app = Flask(__name__)
@@ -1240,6 +1245,8 @@ def screen():
     png, content_type, err = _fetch_screenshot(**kwargs)
     if err is not None:
         return err
+    if TRAJECTORY_RECORDING and isinstance(png, (bytes, bytearray)):
+        _trajectory_screen(bytes(png))
     resp = Response(png, content_type=content_type)
     try:
         digest, _, _ = _frame_hash(png, None, DEFAULT_MASK_BOTTOM)
@@ -1587,7 +1594,106 @@ def stop_background(timeout=2.0):
         thread.join(timeout)
 
 
+# ---------------------------------------------------------------------------
+# Toggle: trajectory recording (WP4; partner ruling 2026-11-15 18:57,
+# "off by default; the switch carries the typed-text warning"). Off:
+# nothing is written anywhere. On: every act forwarded to the hands is
+# appended to <dir>/<YYYYMMDD>/actions.jsonl (op, parameters, status,
+# error code) and every screenshot served by /v1/screen is saved next to
+# it as screen-<ms>.png. Local folder only (default
+# %USERPROFILE%\.HandsRelayV0.1\trajectories); nothing is uploaded.
+# Typed text ("text" parameters: type, clipboard_set) is replaced by
+# {"redacted": true, "chars": n} unless the second switch
+# TRAJECTORY_TYPED_TEXT is also on. Key / hotkey names are kept (they
+# are usually enter/tab/ctrl+s, but a password typed one key at a time
+# would be visible). Recording errors never fail an act.
+# ---------------------------------------------------------------------------
+TRAJECTORY_RECORDING = _env_flag("HANDSRELAY_TRAJECTORY_RECORDING")
+TRAJECTORY_TYPED_TEXT = _env_flag("HANDSRELAY_TRAJECTORY_TYPED_TEXT")
+TRAJECTORY_DIR = os.environ.get("HANDSRELAY_TRAJECTORY_DIR", "").strip() or os.path.join(
+    os.path.expanduser("~"), ".HandsRelayV0.1", "trajectories"
+)
+_TEXT_KEYS = ("text",)
+_trajectory_lock = threading.Lock()
+_trajectory_warned = False
+
+
+def _trajectory_params(payload):
+    out = {}
+    for key, value in (payload or {}).items():
+        key = str(key)[:64]
+        if key in _TEXT_KEYS and not TRAJECTORY_TYPED_TEXT:
+            out[key] = {"redacted": True, "chars": len(value) if isinstance(value, str) else None}
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            out[key] = value[:4096] if isinstance(value, str) else value
+        else:
+            try:
+                text = json.dumps(value)
+            except (TypeError, ValueError):
+                text = repr(value)
+            out[key] = json.loads(text) if len(text) <= 4096 else {"truncated": True}
+    return out
+
+
+def _trajectory_folder(now):
+    folder = os.path.join(TRAJECTORY_DIR, time.strftime("%Y%m%d", time.localtime(now)))
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _trajectory_failed(exc):
+    global _trajectory_warned
+    if not _trajectory_warned:
+        _trajectory_warned = True
+        log_event(f"trajectory recording could not write to {TRAJECTORY_DIR}: {exc.__class__.__name__}")
+
+
+def _trajectory_record(op, payload, status, result, now=None):
+    now = time.time() if now is None else now
+    line = {
+        "t": round(now, 3),
+        "kind": "act",
+        "op": _short(op),
+        "params": _trajectory_params(payload),
+        "status": status,
+        "ok": isinstance(status, int) and 200 <= status < 300,
+        "error_code": result.get("error_code") if isinstance(result, dict) else None,
+        "typed_text": TRAJECTORY_TYPED_TEXT,
+    }
+    try:
+        with _trajectory_lock:
+            with open(os.path.join(_trajectory_folder(now), "actions.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(line, sort_keys=True) + "\n")
+    except (OSError, TypeError, ValueError) as exc:
+        _trajectory_failed(exc)
+
+
+def _trajectory_screen(png, now=None):
+    now = time.time() if now is None else now
+    try:
+        with _trajectory_lock:
+            folder = _trajectory_folder(now)
+            name = f"screen-{int(now * 1000)}.png"
+            with open(os.path.join(folder, name), "wb") as fh:
+                fh.write(png)
+            with open(os.path.join(folder, "actions.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"t": round(now, 3), "kind": "screen", "file": name}, sort_keys=True) + "\n")
+    except (OSError, TypeError) as exc:
+        _trajectory_failed(exc)
+
+
 def _forward_act(op, payload):
+    """Forward one act (see _forward_act_once) and, when the trajectory
+    recording toggle is on, append it to the local recording. Every act
+    path (/v1/act, /v1/act/queued and its retry pump, /v1/act/batch)
+    comes through here."""
+    status, result = _forward_act_once(op, payload)
+    if TRAJECTORY_RECORDING:
+        _trajectory_record(op, payload, status, result)
+    return status, result
+
+
+def _forward_act_once(op, payload):
     """Forward one act to the hands. Returns (status_code, json_dict).
 
     This is exactly the forwarding /v1/act has always done, factored out
@@ -1711,10 +1817,6 @@ def act():
 # also stops at any other failure. Set live by the app's settings
 # (gw.BATCHED_ACTIONS) or env HANDSRELAY_BATCHED_ACTIONS=1 standalone.
 # ---------------------------------------------------------------------------
-def _env_flag(name):
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
 BATCHED_ACTIONS = _env_flag("HANDSRELAY_BATCHED_ACTIONS")
 BATCH_MAX = 50
 
