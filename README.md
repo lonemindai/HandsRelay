@@ -48,6 +48,24 @@ The historical `.HandsRelayV0.1` directory is retained as a compatibility storag
   value to the gateway and the hands, so the two can never disagree about
   it the way the old two-app setup could.
 
+## Tray icon and Settings
+
+The packaged app puts a HandsRelay icon in the Windows notification area
+(it may sit in the overflow ^). Its tint and corner badge show the state:
+grey = stopped, green = running and free (purple badge: an agent is
+watching), blue badge = an agent holds the hands, amber = paused by you,
+red = the gateway or hands is down; a white dot at top-left means you are
+using the PC and the agent is waiting. Hover for the same in words.
+Left-click opens the window; right-click offers Open dashboard, Settings,
+Pause relay (releases the claim and refuses every agent act until you
+resume) and Quit.
+
+Settings live in `%USERPROFILE%\.HandsRelayV0.1\settings.json`
+(versioned). Every default is the behaviour from before settings existed.
+A damaged file is left in place, the app uses the defaults and shows a
+warning in the window. To add a setting, see the docstring at the top of
+`relay_settings.py`.
+
 ## Quickstart (services)
 
 Docker is an option, never a requirement — both services are plain
