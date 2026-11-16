@@ -188,6 +188,20 @@ Plain `POST /v1/act` surfaces that as-is and is unchanged.
   held in memory only while the receipt is held and dropped when it
   settles.
 
+### Watcher pause signal (item 32)
+
+A watcher (eyes-only agent: `POST /v1/watch {holder}` or `?watcher=` on
+the screen routes) can now say it is pausing:
+`POST /v1/watch/pause {"holder", "reason"?, "timeout_seconds"?}`. The
+watcher stays listed with `"state": "paused"` under a pause lease
+(default 900 s, 30-3600 s) instead of lapsing after the 30-60 s poll
+timeout; its next touch resumes it (`"state": "watching"`). A watcher that
+is released (`POST /v1/watch/release`) or times out is **stopped** and is
+listed in `watchers_stopped` (`how`: `released` / `timed_out`) on
+`/v1/watch` and `/v1/info` for 5 minutes. The dashboard shows watching /
+paused / stopped; the tray shows a paused-only watcher as free. Clients
+that never pause see the old behaviour plus a `state` field.
+
 ## File drop
 
 `POST /v1/filedrop` with

@@ -103,7 +103,7 @@ def test_owner_aborted_receipt_is_terminal_and_not_replayed(monkeypatch, held):
 def test_watcher_age_is_bounded_and_filters_malformed_records():
     mod = load('hands_relay_v4_app.py', 'finish_app')
     assert mod._watcher_activity([{'holder':'a','last_seen':90}, {'holder':'b','last_seen':110}, {'holder':'c','last_seen':float('nan')}, None], 100) == [
-        {'holder':'a','last_poll_ago_s':10}, {'holder':'b','last_poll_ago_s':0}]
+        {'holder':'a','last_poll_ago_s':10,'state':'watching'}, {'holder':'b','last_poll_ago_s':0,'state':'watching'}]
 
 
 def test_legacy_import_shares_current_state(monkeypatch):

@@ -154,6 +154,10 @@
     } else if (mode === "watcher") {
       modeText = "Watcher";
       modeCls = "chip chip-info";
+    } else if (mode === "watcher-paused") {
+      // Item 32: the watcher said it is pausing.
+      modeText = "Watcher paused";
+      modeCls = "chip chip-quiet";
     } else if (!m) {
       modeText = "—";
     }
@@ -165,9 +169,16 @@
     parts.push(wt == null ? "watcher timeout —" : `watcher timeout ${dur(wt)}`);
     const activity = (m && m.watcher_activity) || [];
     if (activity.length) {
-      parts.push(activity.map((w) => `${w.holder}: poll ${dur(w.last_poll_ago_s)} ago`).join("; "));
+      parts.push(activity.map((w) => (w.state === "paused"
+        ? `${w.holder}: paused${w.pause_reason ? " (" + w.pause_reason + ")" : ""}, last seen ${dur(w.last_poll_ago_s)} ago`
+        : `${w.holder}: watching, poll ${dur(w.last_poll_ago_s)} ago`)).join("; "));
     } else {
       parts.push("no active poller");
+    }
+    // Item 32: stopped = released or timed out (kept 5 min).
+    const stopped = (m && m.watchers_stopped) || [];
+    if (stopped.length) {
+      parts.push(stopped.map((w) => `${w.holder}: stopped (${w.how === "released" ? "released" : "timed out"}${w.stopped_ago_s == null ? "" : ", " + dur(w.stopped_ago_s) + " ago"})`).join("; "));
     }
     setText($("watcher-setting"), parts.join(" · "));
   }

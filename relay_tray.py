@@ -74,6 +74,9 @@ def tray_state(view, yield_idle_s=5):
             variant, line = "claimed", f"claimed by {holder}"
         elif model.get("mode") == "watcher":
             variant, line = "watching", "free (agent watching)"
+        elif model.get("mode") == "watcher-paused":
+            # Item 32: a paused watcher is not watching; the icon says free.
+            variant, line = "free", "free (agent paused watching)"
         else:
             variant, line = "free", "running, free"
         if variant != "fault" and "parser" in down:

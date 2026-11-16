@@ -176,6 +176,34 @@ def _watcher_timeout_setting():
         return _watcher_timeout
 
 
+# Item 32 (partner ruling 2026-11-15 19:02): an "I'm pausing" signal.
+# POST /v1/watch/pause {holder, reason?, timeout_seconds?} marks the
+# watcher paused: it stays listed (state "paused") under its own longer
+# pause lease instead of lapsing after the 30-60 s poll timeout; the next
+# touch (POST /v1/watch or ?watcher=) resumes it. A watcher that is
+# released or times out is "stopped" and stays visible as such for
+# STOPPED_KEEP_SECONDS so the dashboard can say so honestly. Clients that
+# never pause see exactly the old behaviour plus a "state" field.
+WATCHER_PAUSE_DEFAULT = 900
+WATCHER_PAUSE_MIN = 30
+WATCHER_PAUSE_MAX = 3600
+STOPPED_KEEP_SECONDS = 300
+_stopped_watchers = OrderedDict()  # holder -> {"holder","state","how","stopped_at"}
+
+
+def _mark_stopped_locked(holder, how, now):
+    _stopped_watchers.pop(holder, None)
+    _stopped_watchers[holder] = {"holder": holder, "state": "stopped", "how": how, "stopped_at": now}
+    while len(_stopped_watchers) > WATCHERS_MAX:
+        _stopped_watchers.popitem(last=False)
+
+
+def _watcher_deadline(entry):
+    if entry.get("state") == "paused":
+        return entry["paused_at"] + entry["pause_timeout_seconds"]
+    return entry["last_seen"] + entry["timeout_seconds"]
+
+
 def _touch_watcher(holder, timeout_seconds=None, now=None):
     holder = str(holder or "").strip()[:80]
     if not holder:
@@ -190,28 +218,77 @@ def _touch_watcher(holder, timeout_seconds=None, now=None):
             oldest = min(_watchers.values(), key=lambda e: e["last_seen"])
             del _watchers[oldest["holder"]]
         entry = _watchers.get(holder)
-        if entry is None or now >= entry["last_seen"] + entry["timeout_seconds"]:
+        if entry is None:
             entry = {"holder": holder, "since": now, "timeout_seconds": default}
             _watchers[holder] = entry
         if timeout_seconds is not None:
             entry["timeout_seconds"] = _clamp_number(
                 timeout_seconds, default, WATCHER_TIMEOUT_MIN, WATCHER_TIMEOUT_MAX
             )
+        # Item 32: any touch resumes a paused watcher.
+        entry["state"] = "watching"
+        for key in ("paused_at", "pause_timeout_seconds", "pause_reason"):
+            entry.pop(key, None)
         entry["last_seen"] = now
+        _stopped_watchers.pop(holder, None)
         return dict(entry)
 
 
+def _pause_watcher(holder, reason=None, timeout_seconds=None, now=None):
+    """Item 32: the watcher declares it is pausing. Creates the entry if
+    the watcher was not known (a pause is also a sign of life)."""
+    holder = str(holder or "").strip()[:80]
+    if not holder:
+        return None
+    now = time.time() if now is None else now
+    entry = _touch_watcher(holder, now=now)
+    with _watch_lock:
+        entry = _watchers.get(holder)
+        if entry is None:  # evicted between the two locks; vanishingly rare
+            return None
+        entry["state"] = "paused"
+        entry["paused_at"] = now
+        entry["pause_timeout_seconds"] = _clamp_number(
+            WATCHER_PAUSE_DEFAULT if timeout_seconds is None else timeout_seconds,
+            WATCHER_PAUSE_DEFAULT, WATCHER_PAUSE_MIN, WATCHER_PAUSE_MAX,
+        )
+        entry["pause_reason"] = str(reason).strip()[:120] if reason else ""
+        return dict(entry)
+
+
+def _release_watcher(holder, now=None):
+    now = time.time() if now is None else now
+    with _watch_lock:
+        removed = _watchers.pop(holder, None) is not None
+        if removed:
+            _mark_stopped_locked(holder, "released", now)
+    return removed
+
+
 def _expire_watchers_locked(now):
-    for holder in [h for h, e in _watchers.items() if now >= e["last_seen"] + e["timeout_seconds"]]:
+    for holder in [h for h, e in _watchers.items() if now >= _watcher_deadline(e)]:
         del _watchers[holder]
+        _mark_stopped_locked(holder, "timed_out", now)
+    for holder in [h for h, e in _stopped_watchers.items() if now >= e["stopped_at"] + STOPPED_KEEP_SECONDS]:
+        del _stopped_watchers[holder]
 
 
 def _current_watchers(now=None):
-    """Live watchers (lazy expiry), oldest first."""
+    """Live watchers (lazy expiry), oldest first. Each carries "state":
+    "watching" or "paused" (item 32)."""
     now = time.time() if now is None else now
     with _watch_lock:
         _expire_watchers_locked(now)
         return sorted((dict(e) for e in _watchers.values()), key=lambda e: e["since"])
+
+
+def _stopped_watcher_list(now=None):
+    """Item 32: watchers released or timed out in the last
+    STOPPED_KEEP_SECONDS, most recent first."""
+    now = time.time() if now is None else now
+    with _watch_lock:
+        _expire_watchers_locked(now)
+        return sorted((dict(e) for e in _stopped_watchers.values()), key=lambda e: -e["stopped_at"])
 
 
 def _active_reservation_locked(now):
@@ -366,6 +443,7 @@ def _reset_coordination_state():
     global _watcher_timeout
     with _watch_lock:
         _watchers.clear()
+        _stopped_watchers.clear()
         _watcher_timeout = None
     with _frame_hash_cache_lock:
         _frame_hash_cache.clear()
@@ -606,6 +684,7 @@ def info():
             "hands_claim": _current_claim(),
             "pc_state": pc_state,
             "watchers": _current_watchers(),
+            "watchers_stopped": _stopped_watcher_list(),
             "watcher_timeout_seconds": _watcher_timeout_setting(),
             "paused": PAUSED,
         }
@@ -615,7 +694,12 @@ def info():
 @app.get("/v1/watch")
 def watch_status():
     return jsonify(
-        {"ok": True, "watchers": _current_watchers(), "timeout_seconds": _watcher_timeout_setting()}
+        {
+            "ok": True,
+            "watchers": _current_watchers(),
+            "watchers_stopped": _stopped_watcher_list(),
+            "timeout_seconds": _watcher_timeout_setting(),
+        }
     )
 
 
@@ -635,9 +719,20 @@ def watch_release():
     holder = str(body.get("holder") or "").strip()
     if not holder:
         return jsonify({"ok": False, "error": "holder is required"}), 400
-    with _watch_lock:
-        removed = _watchers.pop(holder, None) is not None
+    removed = _release_watcher(holder)
     return jsonify({"ok": True, "released": removed})
+
+
+@app.post("/v1/watch/pause")
+def watch_pause():
+    """{holder, reason?, timeout_seconds?}: item 32, "I'm pausing". The
+    watcher stays listed as paused (lease 900 s default, 30-3600 s) and
+    resumes on its next touch."""
+    body = _json_body()
+    entry = _pause_watcher(body.get("holder"), body.get("reason"), body.get("timeout_seconds"))
+    if entry is None:
+        return jsonify({"ok": False, "error": "holder is required"}), 400
+    return jsonify({"ok": True, "watcher": entry})
 
 
 @app.post("/v1/watch/config")

@@ -345,11 +345,42 @@ def _resting_or_none(value):
     return out
 
 
-def _watchers_or_empty(value):
-    """R11: watcher holder names from /v1/info, oldest first."""
+def _watcher_state(watcher):
+    """Item 32: "paused" only when the gateway says so; anything else
+    (including an older gateway with no state field) is "watching"."""
+    return "paused" if watcher.get("state") == "paused" else "watching"
+
+
+def _watchers_or_empty(value, state=None):
+    """R11: watcher holder names from /v1/info, oldest first. With state,
+    only watchers in that state (item 32)."""
     if not isinstance(value, list):
         return []
-    return [str(w["holder"]) for w in value if isinstance(w, dict) and w.get("holder")]
+    return [
+        str(w["holder"])
+        for w in value
+        if isinstance(w, dict) and w.get("holder") and (state is None or _watcher_state(w) == state)
+    ]
+
+
+def _stopped_watchers(value, now):
+    """Item 32: watchers released or timed out recently (gateway
+    watchers_stopped), with how and how long ago."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for w in value[:16]:
+        if not isinstance(w, dict) or not w.get("holder"):
+            continue
+        stamp = w.get("stopped_at")
+        ago = (
+            max(0.0, float(now) - float(stamp))
+            if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and math.isfinite(stamp)
+            else None
+        )
+        how = w.get("how") if w.get("how") in ("released", "timed_out") else None
+        out.append({"holder": str(w["holder"]), "how": how, "stopped_ago_s": ago})
+    return out
 
 
 def _watcher_activity(value, now):
@@ -362,16 +393,27 @@ def _watcher_activity(value, now):
             continue
         stamp = watcher.get("last_seen")
         if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and math.isfinite(stamp):
-            result.append({"holder": str(watcher["holder"]), "last_poll_ago_s": max(0.0, float(now) - float(stamp))})
+            item = {
+                "holder": str(watcher["holder"]),
+                "last_poll_ago_s": max(0.0, float(now) - float(stamp)),
+                "state": _watcher_state(watcher),
+            }
+            if item["state"] == "paused":
+                reason = watcher.get("pause_reason")
+                item["pause_reason"] = str(reason)[:120] if isinstance(reason, str) else ""
+            result.append(item)
     return result
 
 
-def _agent_mode(claim_model, watchers):
+def _agent_mode(claim_model, watchers, paused_watchers=()):
     """R11 (#5): what the connected agent(s) are doing. A claim holder is
-    in hands control; anyone watching without the claim is a watcher."""
+    in hands control; anyone watching without the claim is a watcher;
+    item 32: only paused watchers -> "watcher-paused"."""
     if claim_model:
         return "control"
-    return "watcher" if watchers else "none"
+    if watchers:
+        return "watcher"
+    return "watcher-paused" if paused_watchers else "none"
 
 
 def build_dashboard_model(info, claim, queue, reserved_for, receipts, now):
@@ -458,7 +500,12 @@ def build_dashboard_model(info, claim, queue, reserved_for, receipts, now):
     watcher_records = info_dict.get("watchers")
     watchers = [
         name
-        for name in _watchers_or_empty(watcher_records)
+        for name in _watchers_or_empty(watcher_records, "watching")
+        if not claim_model or name != claim_model["holder"]
+    ]
+    paused_watchers = [
+        name
+        for name in _watchers_or_empty(watcher_records, "paused")
         if not claim_model or name != claim_model["holder"]
     ]
     # A claim holder can still poll; do not hide its heartbeat from the tracker.
@@ -467,8 +514,10 @@ def build_dashboard_model(info, claim, queue, reserved_for, receipts, now):
     return {
         "services": services,
         "claim": claim_model,
-        "mode": _agent_mode(claim_model, watchers),
+        "mode": _agent_mode(claim_model, watchers, paused_watchers),
         "watchers": watchers,
+        "watchers_paused": paused_watchers,
+        "watchers_stopped": _stopped_watchers(info_dict.get("watchers_stopped"), now),
         "watcher_activity": watcher_activity,
         "watcher_timeout_s": wt,
         "queue_len": len(queue) if isinstance(queue, list) else 0,
@@ -501,9 +550,12 @@ def format_diagnostics(model, stamp):
     mode = model.get("mode")
     if mode is not None:
         text = {"control": "Mode: hands control", "watcher": "Mode: watcher",
+                "watcher-paused": "Mode: watcher paused",
                 "none": "Mode: no agent"}.get(mode, "Mode: unknown")
         if model.get("watchers"):
             text += " · watching: " + ", ".join(model["watchers"])
+        if model.get("watchers_paused"):
+            text += " · paused: " + ", ".join(model["watchers_paused"])
         if model.get("watcher_timeout_s") is not None:
             text += f" · watcher timeout {_fmt_duration(model['watcher_timeout_s'])}"
         lines.append(text)
