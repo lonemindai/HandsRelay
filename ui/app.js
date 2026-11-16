@@ -11,7 +11,9 @@
 (() => {
   "use strict";
 
-  const KEY = new URLSearchParams(location.hash.slice(1)).get("k") || "";
+  const HASH = new URLSearchParams(location.hash.slice(1));
+  const KEY = HASH.get("k") || "";
+  const OPEN_SETTINGS = HASH.get("view") === "settings";
   history.replaceState(null, "", location.pathname);
 
   const $ = (id) => document.getElementById(id);
@@ -324,7 +326,94 @@
     appendLog(view.log || []);
     logSeq = Math.max(logSeq, view.log_seq || 0);
     renderElevation(view.elevations);
+    renderPause(view);
   }
+
+  // -------------------------------------------- pause + settings (tray)
+  let paused = false;
+  function renderPause(view) {
+    paused = !!view.paused;
+    const btn = $("btn-pause");
+    btn.disabled = !view.started;
+    btn.classList.toggle("is-paused", paused);
+    setText(btn, paused ? "Resume relay" : "Pause relay");
+    $("paused-banner").hidden = !(view.started && paused);
+    const warns = view.settings_warnings || [];
+    $("settings-warning").hidden = warns.length === 0;
+    setText($("settings-warning-text"), warns.join(" "));
+  }
+
+  $("btn-pause").addEventListener("click", async () => {
+    const { data } = await api("/api/pause", { method: "POST", body: { paused: !paused } });
+    if (!data.ok) toast(data.error || "Pause failed", true);
+  });
+
+  let settingsSchema = [];
+  async function openSettings() {
+    const { data } = await api("/api/settings");
+    if (!data.ok) { toast(data.error || "Settings unavailable", true); return; }
+    settingsSchema = data.schema || [];
+    const form = $("settings-form");
+    form.replaceChildren();
+    let group = null;
+    for (const s of settingsSchema) {
+      if (s.group !== group) {
+        group = s.group;
+        const h = document.createElement("div");
+        h.className = "settings-group";
+        h.textContent = group;
+        form.appendChild(h);
+      }
+      const row = document.createElement("label");
+      row.className = "setting";
+      const label = document.createElement("span");
+      label.className = "setting-label";
+      label.textContent = s.label;
+      const input = document.createElement("input");
+      input.dataset.key = s.key;
+      if (s.kind === "bool") {
+        input.type = "checkbox";
+        input.checked = !!data.values[s.key];
+      } else {
+        input.type = "number";
+        input.step = "1";
+        if (s.min !== null) input.min = String(s.min);
+        if (s.max !== null) input.max = String(s.max);
+        input.value = String(data.values[s.key]);
+      }
+      const help = document.createElement("span");
+      help.className = "setting-help";
+      const when = s.applies === "live" ? "Applies when saved." : "Applies on the next Start.";
+      help.textContent = `${s.help} Default: ${s.kind === "bool" ? (s.default ? "on" : "off") : s.default}. ${when}`;
+      row.append(label, input, help);
+      form.appendChild(row);
+    }
+    const warn = $("settings-modal-warn");
+    warn.hidden = !(data.warnings && data.warnings.length);
+    warn.textContent = (data.warnings || []).join(" ");
+    $("settings").hidden = false;
+  }
+  window.hrOpenSettings = openSettings;
+
+  $("btn-settings").addEventListener("click", openSettings);
+  $("settings-close").addEventListener("click", () => { $("settings").hidden = true; });
+  $("settings-save").addEventListener("click", async () => {
+    const out = {};
+    for (const input of $("settings-form").querySelectorAll("input[data-key]")) {
+      out[input.dataset.key] = input.type === "checkbox" ? input.checked : Number(input.value);
+    }
+    const { data } = await api("/api/settings", { method: "POST", body: { settings: out } });
+    if (!data.ok) { toast(data.error || "Settings not saved", true); return; }
+    toast("Settings saved");
+    $("settings").hidden = true;
+  });
+  $("settings-reset").addEventListener("click", async () => {
+    const { data } = await api("/api/settings", { method: "POST", body: { reset: true } });
+    if (!data.ok) { toast(data.error || "Reset failed", true); return; }
+    toast("Settings reset to defaults");
+    openSettings();
+  });
+  if (OPEN_SETTINGS) openSettings();
 
   // ------------------------------------------------------------ loop
   let failures = 0;

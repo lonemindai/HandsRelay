@@ -323,3 +323,19 @@ body[data-phase="running"] .card-title .ico { color: var(--ok); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ------------------------------------------------- settings + pause (tray) */
+.banner[hidden] { display: none; }
+body:not([data-phase="idle"]) .banner.banner-paused:not([hidden]),
+body:not([data-phase="idle"]) .banner.banner-warn:not([hidden]) { display: block; }
+.banner-paused { border-color: rgba(255, 181, 71, 0.5); }
+.banner-warn { border-color: rgba(255, 92, 108, 0.5); }
+#btn-pause.is-paused { color: var(--warn); }
+.settings-card { max-width: 640px; max-height: 86vh; overflow: auto; }
+.settings-form { display: grid; gap: 14px; margin: 12px 0; }
+.settings-group { font: 600 12px var(--display); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-top: 6px; }
+.setting { display: grid; grid-template-columns: 1fr auto; gap: 4px 14px; align-items: center; }
+.setting-label { font-weight: 600; }
+.setting-help { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
+.setting input[type="number"] { width: 96px; }
+.settings-warn { color: var(--bad, #ff5c6c); margin: 8px 0; }

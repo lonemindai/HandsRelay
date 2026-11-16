@@ -38,6 +38,8 @@
       <span class="track"><span class="thumb"></span></span>
       <span class="switch-label">Start on login</span>
     </label>
+    <button class="btn btn-ghost" id="btn-pause" title="Release the claim and refuse every agent act until you resume" disabled>Pause relay</button>
+    <button class="btn btn-ghost" id="btn-settings" title="Relay settings">Settings</button>
     <button class="btn btn-primary" id="btn-start">
       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 4l10 6-10 6z"/></svg>
       <span id="start-label">Start</span>
@@ -52,6 +54,16 @@
 <section class="banner" id="idle-banner">
   <div class="banner-title">Services are stopped.</div>
   <div class="banner-text">Press <b>Start</b> to run all three services in this window. Nothing starts on its own.</div>
+</section>
+
+<section class="banner banner-paused" id="paused-banner" hidden>
+  <div class="banner-title">Relay paused.</div>
+  <div class="banner-text">No agent can claim the hands or act until you press <b>Resume relay</b>.</div>
+</section>
+
+<section class="banner banner-warn" id="settings-warning" hidden>
+  <div class="banner-title">Settings file problem.</div>
+  <div class="banner-text" id="settings-warning-text"></div>
 </section>
 
 <main class="grid">
@@ -170,6 +182,23 @@
       <button class="btn btn-warn" id="elev-approve">Approve — run elevated</button>
     </div>
     <div class="modal-more" id="elev-more" hidden></div>
+  </div>
+</div>
+
+<!-- settings: rendered from the schema the app serves (relay_settings.SETTINGS) -->
+<div class="modal" id="settings" hidden>
+  <div class="modal-card settings-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-kicker">HandsRelay</div>
+    <h2 id="settings-title">Settings</h2>
+    <p class="modal-text">Every default is how the relay behaved before settings existed.</p>
+    <div class="settings-warn" id="settings-modal-warn" hidden></div>
+    <form id="settings-form" class="settings-form"></form>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="settings-reset" type="button">Reset to defaults</button>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost" id="settings-close" type="button">Close</button>
+      <button class="btn btn-primary" id="settings-save" type="button">Save</button>
+    </div>
   </div>
 </div>
 

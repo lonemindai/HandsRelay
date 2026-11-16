@@ -59,6 +59,8 @@ import flask
 import pyautogui  # noqa: F401
 import requests
 import waitress
+
+import relay_settings
 from PIL import Image  # noqa: F401
 
 try:  # Optional (review E1): richer /windows (process names) when installed.
@@ -744,8 +746,15 @@ class RelayApp:
         self._pending_elevations = {}  # eid -> request shown in the window
         self._elevation_dialog_open = False
         self.on_quit = None  # the window shell sets this (closes the window)
+        # Tray + settings (2026-11-15): persisted owner settings, every
+        # default equal to the pre-settings behaviour; owner pause.
+        self.settings = relay_settings.SettingsStore()
+        self.settings.load()
+        self.paused = False
         self.root.after(300, self._drain_queue)
         self.log_line("Press Start to run all three services in this window.")
+        for warning in self.settings.warnings:
+            self.log_line(f"WARNING: {warning}")
 
     # ---------- view (read by the UI server) ----------
     def view(self, since=0):
@@ -765,6 +774,8 @@ class RelayApp:
             "autostart": _autostart_enabled(),
             "token_ready": bool(self.token),
             "resting_hand": self._resting_view(model),
+            "paused": self.paused,
+            "settings_warnings": list(self.settings.warnings),
         }
 
     def _resting_view(self, model):
@@ -794,6 +805,65 @@ class RelayApp:
                 "(autostart is only available on Windows)."
             )
         return ok
+
+    # ---------- settings + pause (tray ticket) ----------
+    def set_paused(self, paused):
+        """Owner pause: release the claim and refuse every act and claim
+        until resumed. Before Start it is remembered and applied when the
+        gateway loads."""
+        self.paused = bool(paused)
+        gw = self._gateway_module
+        released = None
+        if gw is not None and callable(getattr(gw, "set_paused", None)):
+            released = gw.set_paused(self.paused)
+        if self.paused:
+            self.log_line(
+                "Relay PAUSED: no agent can claim the hands or act until you resume"
+                + (f" (released the claim held by {released})." if released else ".")
+            )
+        else:
+            self.log_line("Relay resumed: agents may claim the hands again.")
+        return self.paused
+
+    def update_settings(self, changes):
+        before = dict(self.settings.values)
+        ok, errors = self.settings.update(changes)
+        if not ok:
+            return False, errors
+        changed = {k: v for k, v in self.settings.values.items() if before.get(k) != v}
+        self._apply_settings(changed)
+        for key, value in changed.items():
+            spec = relay_settings.BY_KEY[key]
+            when = "now" if spec.applies == "live" else "on the next Start"
+            self.log_line(f"Setting changed: {spec.label} -> {value!r} (applies {when}).")
+        return True, []
+
+    def reset_settings(self):
+        before = dict(self.settings.values)
+        self.settings.reset()
+        changed = {k: v for k, v in self.settings.values.items() if before.get(k) != v}
+        self._apply_settings(changed)
+        self.log_line("Settings reset to defaults.")
+
+    def _apply_settings(self, values):
+        """Push settings into the running services. Called with only the
+        keys that differ from defaults at Start (so an untouched store
+        changes nothing, and an operator's env vars still win), and with
+        the changed keys on every save."""
+        if "owner_yield_idle_seconds" in values:
+            # The hands read this env var per act, so it is live.
+            os.environ["HANDS_YIELD_IDLE_SECONDS"] = str(values["owner_yield_idle_seconds"])
+        if "watcher_timeout_seconds" in values:
+            os.environ["WATCHER_TIMEOUT_SECONDS"] = str(values["watcher_timeout_seconds"])
+        gw = self._gateway_module
+        if gw is not None:
+            if "claim_ttl_default_seconds" in values:
+                gw.CLAIM_TTL_DEFAULT = values["claim_ttl_default_seconds"]
+            if "queued_act_hold_seconds" in values:
+                gw.HOLD_DEFAULT = values["queued_act_hold_seconds"]
+        hands = self._hands_module
+        if hands is not None and "paste_auto_min_chars" in values:
+            hands.PASTE_AUTO_MIN_CHARS = values["paste_auto_min_chars"]
 
     # ---------- helpers ----------
     def _stamp(self):
@@ -1015,6 +1085,7 @@ class RelayApp:
         os.environ["HANDS_URL"] = HANDS_URL
         os.environ["HANDS_SECRET"] = hands_secret
         os.environ["PARSER_URL"] = f"http://127.0.0.1:{PARSER_PORT}"
+        self._apply_settings(relay_settings.changed_from_defaults(self.settings.values))
 
         self._health = {name: ServiceHealth() for name in SERVICE_FILES}
         self._start_one("hands")
@@ -1101,8 +1172,11 @@ class RelayApp:
             # Review E4: gateway lockouts alert through the hands' ntfy topic.
             module.ALERT_HOOK = self._alert_via_hands
             self._gateway_module = module
+            if self.paused and callable(getattr(module, "set_paused", None)):
+                module.set_paused(True)
         if name == "parser":
             self._parser_module = module
+        self._apply_settings(relay_settings.changed_from_defaults(self.settings.values))
         try:
             # R4 (F9): match the gateway module's 32 — long-poll
             # endpoints must not starve act traffic of threads.
@@ -1475,6 +1549,36 @@ def build_ui_server(relay, ui_key, port_ref=None):
         ok = relay.set_autostart(value)
         return flask.jsonify({"ok": bool(ok), "autostart": _autostart_enabled()})
 
+    @ui.get("/api/settings")
+    def _settings_get():
+        return flask.jsonify(
+            {
+                "ok": True,
+                "schema": relay_settings.schema(),
+                "values": dict(relay.settings.values),
+                "warnings": list(relay.settings.warnings),
+            }
+        )
+
+    @ui.post("/api/settings")
+    def _settings_post():
+        body = flask.request.get_json(force=True, silent=True) or {}
+        if body.get("reset") is True:
+            relay.reset_settings()
+            return flask.jsonify({"ok": True, "values": dict(relay.settings.values)})
+        ok, errors = relay.update_settings(body.get("settings"))
+        if not ok:
+            return flask.jsonify({"ok": False, "error": "; ".join(errors)}), 400
+        return flask.jsonify({"ok": True, "values": dict(relay.settings.values)})
+
+    @ui.post("/api/pause")
+    def _pause():
+        body = flask.request.get_json(force=True, silent=True) or {}
+        value = body.get("paused")
+        if not isinstance(value, bool):
+            return flask.jsonify({"ok": False, "error": "paused must be true or false"}), 400
+        return flask.jsonify({"ok": True, "paused": relay.set_paused(value)})
+
     @ui.post("/api/elevation/<eid>")
     def _elevation(eid):
         body = flask.request.get_json(force=True, silent=True) or {}
@@ -1487,6 +1591,57 @@ def build_ui_server(relay, ui_key, port_ref=None):
         return flask.jsonify({"ok": True, "state": state})
 
     return ui
+
+
+TRAY_POLL_S = 2.0
+
+
+def start_tray(relay, show_dashboard, show_settings):
+    """Tray icon (tray + settings ticket). Windows only; a failure here
+    never stops the relay. Returns the TrayIcon or None."""
+    if not relay.settings.get("tray_icon"):
+        return None
+    try:
+        import relay_tray
+    except Exception as exc:
+        relay.log_line(f"Tray icon unavailable ({exc}).")
+        return None
+    if not relay_tray.TrayIcon.supported():
+        return None
+    icon = _icon_path()
+    if not icon:
+        relay.log_line("Tray icon unavailable (relay.ico not found).")
+        return None
+    tray = relay_tray.TrayIcon(
+        icon,
+        on_open=show_dashboard,
+        on_settings=show_settings,
+        on_pause=relay.set_paused,
+        on_quit=lambda: relay.root.after(0, relay.stop),
+        log=relay.log_line,
+    )
+    if not tray.start():
+        relay.log_line("Tray icon did not start; the window still works.")
+        return None
+
+    def refresh():
+        last = None
+        while True:
+            try:
+                state = relay_tray.tray_state(
+                    relay.view(since=10 ** 12),
+                    relay.settings.get("owner_yield_idle_seconds"),
+                )
+                if state != last:
+                    tray.update(state)
+                    last = state
+            except Exception:
+                pass
+            time.sleep(TRAY_POLL_S)
+
+    threading.Thread(target=refresh, name="tray-refresh", daemon=True).start()
+    relay.log_line("Tray icon is up (notification area; it may sit in the overflow).")
+    return tray
 
 
 def main():
@@ -1509,6 +1664,11 @@ def main():
         # browser. Still one GUI — there is no other window.
         relay.log_line("pywebview not available — opened the relay UI in your browser instead.")
         webbrowser.open(url)
+        start_tray(
+            relay,
+            show_dashboard=lambda: webbrowser.open(url),
+            show_settings=lambda: webbrowser.open(url + "&view=settings"),
+        )
         try:
             while True:
                 time.sleep(3600)
@@ -1525,8 +1685,35 @@ def main():
         background_color="#0b0d12",
     )
     relay.on_quit = lambda: window.destroy()
+
+    def show_dashboard():
+        window.show()
+        window.restore()
+
+    def show_settings():
+        show_dashboard()
+        window.evaluate_js("window.hrOpenSettings && window.hrOpenSettings()")
+
+    tray_ref = []
+
+    def on_closing():
+        # Setting close_to_tray (default off = today's behaviour): hide
+        # instead of stopping, only when a tray icon exists to come back.
+        if tray_ref and relay.settings.get("close_to_tray") and not getattr(relay, "_stopping", False):
+            window.hide()
+            return False
+        return None
+
+    window.events.closing += on_closing
     # Closing the window stops all three services, as before.
     window.events.closed += lambda: relay.stop()
+
+    def _tray_when_shown():
+        tray = start_tray(relay, show_dashboard, show_settings)
+        if tray is not None:
+            tray_ref.append(tray)
+
+    window.events.shown += _tray_when_shown
     icon = _icon_path()
     try:
         webview.start(icon=icon) if icon else webview.start()
