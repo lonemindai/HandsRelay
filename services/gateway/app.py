@@ -2702,6 +2702,137 @@ def wait_for():
         time.sleep(min(poll, max(0.0, timeout - waited)))
 
 
+# ---------------------------------------------------------------------------
+# Browser DOM adapter (partner ruling 2026-11-15, toggle, default OFF).
+#
+# Attaches only to a browser the USER started with remote debugging on
+# 127.0.0.1 (see dom_adapter.py). While the toggle is off every /v1/dom
+# route answers 403 error_code "dom_adapter_off" and nothing else in the
+# gateway changes. Reads (tabs, snapshot) respect Pause; acts (click,
+# type) also need the caller to HOLD the hands claim and the owner to be
+# idle past the give-way threshold, the same rules the hands enforce.
+# ---------------------------------------------------------------------------
+DOM_ADAPTER_ENABLED = False
+_dom_mod = None
+
+
+def set_dom_adapter(enabled):
+    """Owner toggle (Settings -> browser_dom_adapter), applied live."""
+    global DOM_ADAPTER_ENABLED
+    enabled = bool(enabled)
+    if enabled != DOM_ADAPTER_ENABLED:
+        log_event("browser DOM adapter " + ("ENABLED by the owner" if enabled else "disabled by the owner"))
+    DOM_ADAPTER_ENABLED = enabled
+    return DOM_ADAPTER_ENABLED
+
+
+def _dom():
+    global _dom_mod
+    if _dom_mod is None:
+        import importlib.util
+        import sys as _sys
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dom_adapter.py")
+        spec = importlib.util.spec_from_file_location("hands_relay_dom_adapter", path)
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        _dom_mod = mod
+    return _dom_mod
+
+
+def _dom_refusal(act=False, holder=""):
+    """(json, status) when the request may not proceed, else None."""
+    if not DOM_ADAPTER_ENABLED:
+        return {
+            "ok": False,
+            "error": "the browser DOM adapter is off; the PC owner can turn it on in the relay's Settings",
+            "error_code": "dom_adapter_off",
+        }, 403
+    if PAUSED:
+        return _paused_response(), 423
+    if not act:
+        return None
+    claim = _current_claim()
+    if not holder:
+        return {"ok": False, "error": "holder is required for DOM actions", "error_code": "bad_request"}, 400
+    if claim is None or claim.get("holder") != holder:
+        return {
+            "ok": False,
+            "error": "DOM actions need the hands claim: POST /v1/hands/claim first",
+            "error_code": "claim_required",
+            "claim": claim,
+        }, 409
+    pc_state = _fetch_pc_state()
+    idle = (pc_state or {}).get("owner_idle_seconds")
+    try:
+        threshold = float(os.environ.get("HANDS_YIELD_IDLE_SECONDS", "5"))
+    except ValueError:
+        threshold = 5.0
+    if not isinstance(idle, (int, float)):
+        return {
+            "ok": False,
+            "error": "cannot confirm the owner is away (hands /state unavailable); DOM action refused",
+            "error_code": "owner_state_unknown",
+        }, 503
+    if idle < threshold:
+        return {
+            "ok": False,
+            "error": "user active: giving way to the PC owner",
+            "error_code": "yield",
+            "owner_idle_seconds": idle,
+        }, 409
+    return None
+
+
+def _dom_call(fn):
+    dom = _dom()
+    try:
+        return jsonify({"ok": True, **fn(dom)}), 200
+    except dom.DomError as exc:
+        return jsonify({"ok": False, "error": exc.message, "error_code": exc.code}), exc.status
+
+
+@app.get("/v1/dom/tabs")
+def dom_tabs():
+    refused = _dom_refusal()
+    if refused:
+        return jsonify(refused[0]), refused[1]
+    return _dom_call(lambda dom: {"tabs": dom.list_tabs()})
+
+
+@app.post("/v1/dom/snapshot")
+def dom_snapshot():
+    """Body: {"tab_id", "max_chars"? (1000-200000, default 20000),
+    "include_values"? (default false; passwords are redacted always)}."""
+    refused = _dom_refusal()
+    if refused:
+        return jsonify(refused[0]), refused[1]
+    body = _json_body()
+    return _dom_call(lambda dom: dom.snapshot(
+        body.get("tab_id"), body.get("max_chars"), body.get("include_values") is True))
+
+
+@app.post("/v1/dom/act")
+def dom_act():
+    """Body: {"holder", "tab_id", "op": "click"|"type", "selector", "text"? }."""
+    body = _json_body()
+    holder = str(body.get("holder") or "").strip()[:HOLDER_MAX_CHARS]
+    refused = _dom_refusal(act=True, holder=holder)
+    if refused:
+        return jsonify(refused[0]), refused[1]
+    op = body.get("op")
+    tab_id, selector = body.get("tab_id"), body.get("selector")
+    if op == "click":
+        fn = lambda dom: {"op": op, **dom.click(tab_id, selector)}  # noqa: E731
+    elif op == "type":
+        fn = lambda dom: {"op": op, **dom.type_text(tab_id, selector, body.get("text"))}  # noqa: E731
+    else:
+        return jsonify({"ok": False, "error": f"unknown DOM op: {_short(op)!r} (click, type)",
+                        "error_code": "bad_request"}), 400
+    log_event(f"DOM {op} by {holder} on tab {_short(tab_id)} selector {_short(selector)}")
+    return _dom_call(fn)
+
+
 if __name__ == "__main__":
     from waitress import serve
 

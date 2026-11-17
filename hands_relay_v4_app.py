@@ -931,6 +931,8 @@ class RelayApp:
                 gw.CUSTOM_TOOLS = bool(values["custom_tools_registry"])
             if "agent_browser_invisible" in values:
                 gw.set_agent_browser(values["agent_browser_invisible"])
+            if "browser_dom_adapter" in values and hasattr(gw, "set_dom_adapter"):
+                gw.set_dom_adapter(values["browser_dom_adapter"])
         hands = self._hands_module
         if hands is not None and "paste_auto_min_chars" in values:
             hands.PASTE_AUTO_MIN_CHARS = values["paste_auto_min_chars"]

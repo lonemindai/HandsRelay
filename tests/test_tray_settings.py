@@ -39,10 +39,10 @@ PLANNED = {
     "browser_dom_adapter", "input_injecting_smoke_script", "agent_browser_invisible",
     "trajectory_record_typed_text",
 }
-# Toggles whose feature is not built yet (toggles wave 1 builds the rest).
-UNBUILT = {
-    "browser_dom_adapter",
-}
+# Toggles whose feature is not built yet: none since v4-rc1 (all 7 ruled toggles built).
+UNBUILT = set()
+# Built toggles: available, still default OFF with a risk note.
+BUILT_TOGGLES = {"browser_dom_adapter"}
 
 
 def test_planned_toggles_are_registered_off_and_hidden():
@@ -59,6 +59,10 @@ def test_planned_toggles_are_registered_off_and_hidden():
     for key in UNBUILT:
         ok, errors = store.update({key: True})
         assert not ok and "not available" in errors[0]
+    for key in BUILT_TOGGLES:
+        spec = rs.BY_KEY[key]
+        assert spec.kind == "bool" and spec.default is False and spec.available is True and spec.risk
+        assert key in shown
 
 
 def test_defaults_equal_todays_behaviour():

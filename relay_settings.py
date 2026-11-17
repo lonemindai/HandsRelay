@@ -157,9 +157,13 @@ PLANNED_TOGGLES = (
     ),
     Setting(
         key="browser_dom_adapter", label="Let agents read and drive web pages through the browser's page structure",
-        help="Works with any model driving the relay, not only Muse.",
-        risk="Page contents, including signed-in sites, become readable to the agent.",
-        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+        help=("Works with any model driving the relay, not only Muse. Only a Chrome/Edge you start "
+              "yourself with --remote-debugging-port=9222 (127.0.0.1) is reachable; the relay never starts it. "
+              "Form values are hidden from the agent; passwords always."),
+        risk=("A browser session is your signed-in accounts: the agent can read those pages and click "
+              "and type in them. Use a separate browser profile for agent work."),
+        kind="bool", default=False, applies="live", group="Agent capabilities", available=True,
+        source="services/gateway/dom_adapter.py (built 2026-11-15)",
     ),
     Setting(
         key="input_injecting_smoke_script", label="Allow the self-test that moves the mouse and types",
