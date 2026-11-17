@@ -33,7 +33,7 @@ def gw(monkeypatch, tmp_path):
     monkeypatch.setenv("HANDSRELAY_TRAJECTORY_DIR", str(tmp_path / "traj"))
     mod = _load("services/gateway/app.py", "tr_gw")
     mod._reset_coordination_state()
-    monkeypatch.setattr(mod, "_forward_act_once", lambda op, p: (200, {"ok": True, "op": op}))
+    monkeypatch.setattr(mod, "_forward_act_once", lambda op, p, path=None: (200, {"ok": True, "op": op}))
     monkeypatch.setattr(mod, "_fetch_screenshot", lambda **kw: (b"\x89PNG-fake", "image/png", None))
     monkeypatch.setattr(mod, "_frame_hash", lambda *a, **k: (_ for _ in ()).throw(mod._HashUnavailable()))
     return mod
