@@ -70,6 +70,14 @@ try:  # Optional (review E1): richer /windows (process names) when installed.
 except ImportError:  # focus and the hwnd pin work without it (ctypes)
     pass
 
+try:  # Optional: the opt-in UI Automation tree (hands/uia.py) uses it;
+    # imported here only so PyInstaller bundles it. Without it that
+    # setting answers "uia_unavailable".
+    import comtypes  # noqa: F401
+    import comtypes.client  # noqa: F401
+except Exception:
+    pass
+
 HANDS_PORT = 5000
 GATEWAY_PORT = 5010
 PARSER_PORT = 5011
@@ -926,6 +934,14 @@ class RelayApp:
         hands = self._hands_module
         if hands is not None and "paste_auto_min_chars" in values:
             hands.PASTE_AUTO_MIN_CHARS = values["paste_auto_min_chars"]
+        if "ui_automation_tree" in values:
+            on = bool(values["ui_automation_tree"])
+            os.environ["RELAY_UIA_TREE"] = "1" if on else "0"
+            os.environ["HANDS_UIA_TREE"] = "1" if on else "0"
+            if gw is not None:
+                gw.UIA_TREE_ENABLED = on
+            if hands is not None:
+                hands.UIA_TREE_ENABLED = on
 
     # ---------- helpers ----------
     def _stamp(self):

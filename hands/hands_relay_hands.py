@@ -116,23 +116,31 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
 
-def _load_motion():
-    """hands/motion.py, loaded by path: the app loads THIS file by path
-    too (and PyInstaller bundles both side by side), so a plain import
-    would depend on sys.path."""
+def _load_sibling(filename, modname):
+    """A hands/ sibling module, loaded by path: the app loads THIS file by
+    path too (and PyInstaller bundles both side by side), so a plain
+    import would depend on sys.path."""
     import importlib.util
 
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motion.py")
-    bundled = os.path.join(getattr(sys, "_MEIPASS", ""), "hands", "motion.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    bundled = os.path.join(getattr(sys, "_MEIPASS", ""), "hands", filename)
     if not os.path.exists(path) and os.path.exists(bundled):
         path = bundled
-    spec = importlib.util.spec_from_file_location("hands_relay_hands_motion", path)
+    spec = importlib.util.spec_from_file_location(modname, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
+def _load_motion():
+    return _load_sibling("motion.py", "hands_relay_hands_motion")
+
+
 motion = _load_motion()
+# Opt-in UI Automation tree (settings key ui_automation_tree, default
+# OFF). uia.py imports nothing Windows-only at module level.
+uia = _load_sibling("uia.py", "hands_relay_hands_uia")
+UIA_TREE_ENABLED = os.environ.get("HANDS_UIA_TREE", "").strip() == "1"
 
 # ---------------------------------------------------------------- server
 
@@ -292,6 +300,8 @@ _ACT_PATHS = {
     "/hotkey",
     "/drag",
     "/focus",
+    # Opt-in UIA element click/focus: same owner yield + focus guard.
+    "/uia/act",
     # R4 (F5): /break injects real Ctrl+C chords and /clipboard/set
     # overwrites the owner's clipboard — both are input/state the owner
     # can collide with, so both sit behind the same WP0b yield.
@@ -874,7 +884,11 @@ def click():
     optional attention (default true) + text_chars: the pre-move
     hesitation. Timing is fitted to the +0.5 s per-click budget.
     """
-    d = _json_body()
+    return _do_click(_json_body())
+
+
+def _do_click(d):
+    """The /click body, shared with /uia/act (click on an element)."""
     try:
         x, y = _xy(d)
     except ValueError as exc:
@@ -2543,6 +2557,105 @@ def focus():
                 )
             return jsonify({"ok": True, "window": _shape_window(win)})
     return jsonify({"ok": False, "error": f"no window matching {title!r}"}), 404
+
+
+# ---------------------------------------------- UI Automation tree (opt-in)
+
+
+def _uia_refusal():
+    """None when UIA routes may run, else the (response, status) refusal."""
+    if not UIA_TREE_ENABLED:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "UI Automation tree is off (Settings: "
+                    "'Let agents read the Windows UI Automation tree')",
+                    "error_code": "uia_disabled",
+                }
+            ),
+            403,
+        )
+    if uia.get_provider() is None:
+        return (
+            jsonify(
+                {"ok": False, "error": uia.unavailable_reason(), "error_code": "uia_unavailable"}
+            ),
+            501,
+        )
+    return None
+
+
+@app.get("/uia/tree")
+def uia_tree():
+    """Read the foreground window's UIA tree. Query: max_depth, max_nodes."""
+    refused = _uia_refusal()
+    if refused is not None:
+        return refused
+    try:
+        result = uia.snapshot(
+            uia.get_provider(),
+            max_depth=request.args.get("max_depth"),
+            max_nodes=request.args.get("max_nodes"),
+        )
+    except uia.UIAError as exc:
+        return jsonify({"ok": False, "error": str(exc), "error_code": "uia_error"}), 409
+    fg = _foreground_window()
+    if fg:
+        result["window"] = _shape_window(fg)
+    return jsonify(result)
+
+
+@app.post("/uia/act")
+def uia_act():
+    """{snapshot, id, action: "click"|"focus", button?} on a tree element.
+
+    Runs behind the same owner yield and expect_focus guard as /click
+    (it is in _ACT_PATHS). click re-reads the element's live rect and
+    clicks its centre through the ordinary /click path (human motion);
+    focus calls the element's UIA SetFocus.
+    """
+    refused = _uia_refusal()
+    if refused is not None:
+        return refused
+    d = _json_body()
+    action = d.get("action", "click")
+    if action not in ("click", "focus"):
+        return _bad_request("action must be 'click' or 'focus'")
+    try:
+        el = uia.resolve(d.get("snapshot"), d.get("id"))
+    except uia.StaleSnapshot as exc:
+        return jsonify({"ok": False, "error": str(exc), "error_code": "uia_stale"}), 409
+    provider = uia.get_provider()
+    rect = provider.alive_rect(el)
+    if rect is None:
+        return (
+            jsonify({"ok": False, "error": "element is gone; read the tree again", "error_code": "uia_stale"}),
+            409,
+        )
+    left, top, right, bottom = rect
+    if action == "focus":
+        try:
+            with _input("mouse"):
+                provider.set_focus(el)
+        except uia.UIAError as exc:
+            return jsonify({"ok": False, "error": str(exc), "error_code": "uia_error"}), 409
+        return jsonify({"ok": True, "action": "focus", "id": d.get("id")})
+    w, h = right - left, bottom - top
+    if w <= 0 or h <= 0:
+        return (
+            jsonify({"ok": False, "error": "element has no on-screen area", "error_code": "uia_offscreen"}),
+            409,
+        )
+    click = {"x": left + w // 2, "y": top + h // 2, "button": d.get("button", "left")}
+    if _human(d):
+        click.update({"w": w, "h": h})
+    if "human" in d:
+        click["human"] = d["human"]
+    out = _do_click(click)
+    if isinstance(out, dict):
+        out = dict(out, action="click", id=d.get("id"))
+    return out
 
 
 # ---------------------------------------------- Actuation: clipboard (#6)

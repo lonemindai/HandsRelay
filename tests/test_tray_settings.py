@@ -41,7 +41,6 @@ PLANNED = {
 }
 # Toggles whose feature is not built yet (toggles wave 1 builds the rest).
 UNBUILT = {
-    "ui_automation_tree",
     "browser_dom_adapter",
 }
 
@@ -57,12 +56,15 @@ def test_planned_toggles_are_registered_off_and_hidden():
     assert PLANNED - UNBUILT <= shown
     assert PLANNED <= {s["key"] for s in rs.schema(include_unavailable=True)}
     store = rs.SettingsStore("/nonexistent/never-written.json")
-    ok, errors = store.update({"ui_automation_tree": True})
-    assert not ok and "not available" in errors[0]
+    for key in UNBUILT:
+        ok, errors = store.update({key: True})
+        assert not ok and "not available" in errors[0]
 
 
 def test_defaults_equal_todays_behaviour():
-    d = {k: v for k, v in rs.defaults().items() if k not in PLANNED}
+    # Built toggles (default off) are covered by their own suites.
+    built = {"ui_automation_tree"}
+    d = {k: v for k, v in rs.defaults().items() if k not in PLANNED | built}
     assert d == {
         "owner_yield_idle_seconds": 5,
         "claim_ttl_default_seconds": 900,
