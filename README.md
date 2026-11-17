@@ -116,6 +116,21 @@ toggles.
   runs whatever its author wrote, on this PC.** Off: both routes are 404.
   Standalone gateway: `HANDSRELAY_CUSTOM_TOOLS=1`, `HANDSRELAY_TOOLS_FILE`.
 
+- **Invisible agent browser** (`agent_browser_invisible`, live). **Browser
+  tasks only, not a full desktop.** The agent starts its own headless Edge
+  (else Chrome) with a separate profile in
+  `%USERPROFILE%\.HandsRelayV0.1\agent-browser\profile`; it never shows on
+  your screen and is driven over the DevTools protocol on 127.0.0.1 (random
+  port), never with your mouse or keyboard, so it needs no claim and you keep
+  working. Routes (token required, 423 while paused):
+  `GET /v1/agent-browser/status`, `POST /v1/agent-browser/{start,stop}`,
+  `open {url}` (http/https/about/data), `read {max_chars?, html?}`,
+  `screenshot` (PNG base64, also saved under `agent-browser\screenshots`),
+  `click {selector}`, `type {selector, text}`. Turning it off kills the
+  browser and all routes are 404. Native Windows apps still run on your
+  desktop. **Risk: pages it opens are readable to the agent.** Standalone
+  gateway: `HANDSRELAY_AGENT_BROWSER=1`.
+
 ## Quickstart (services)
 
 Docker is an option, never a requirement — both services are plain

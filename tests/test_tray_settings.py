@@ -36,13 +36,13 @@ def _load(rel, tag):
 
 PLANNED = {
     "batched_actions", "trajectory_recording", "custom_tools_registry", "ui_automation_tree",
-    "browser_dom_adapter", "input_injecting_smoke_script", "nested_desktop",
+    "browser_dom_adapter", "input_injecting_smoke_script", "agent_browser_invisible",
     "trajectory_record_typed_text",
 }
 # Toggles whose feature is not built yet (toggles wave 1 builds the rest).
 UNBUILT = {
     "ui_automation_tree",
-    "browser_dom_adapter", "nested_desktop",
+    "browser_dom_adapter",
 }
 
 
@@ -57,7 +57,7 @@ def test_planned_toggles_are_registered_off_and_hidden():
     assert PLANNED - UNBUILT <= shown
     assert PLANNED <= {s["key"] for s in rs.schema(include_unavailable=True)}
     store = rs.SettingsStore("/nonexistent/never-written.json")
-    ok, errors = store.update({"nested_desktop": True})
+    ok, errors = store.update({"ui_automation_tree": True})
     assert not ok and "not available" in errors[0]
 
 

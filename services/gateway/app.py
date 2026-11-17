@@ -2021,6 +2021,96 @@ def tools_run(name):
     return jsonify(dict(result, tool=name))
 
 
+# ---------------------------------------------------------------------------
+# Toggle: agent browser, invisible (setting agent_browser_invisible; order
+# v4-toggle-nested). BROWSER TASKS ONLY, not a full desktop. Off: every
+# /v1/agent-browser route is 404 like an unknown route, and turning it off
+# kills the browser. On: the agent starts its own headless Edge/Chrome
+# (dedicated profile, CDP on 127.0.0.1 random port; see agent_browser.py)
+# and drives it over CDP only, never SendInput, so it needs no claim and
+# never yields to the owner: the owner's input is never touched. Pause
+# still refuses everything (423).
+# ---------------------------------------------------------------------------
+AGENT_BROWSER = _env_flag("HANDSRELAY_AGENT_BROWSER")
+_agent_browser = None
+
+
+def _get_agent_browser():
+    global _agent_browser
+    if _agent_browser is None:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_browser.py")
+        spec = importlib.util.spec_from_file_location("handsrelay_agent_browser", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _agent_browser = mod.AgentBrowser()
+    return _agent_browser
+
+
+def set_agent_browser(enabled):
+    """Owner toggle, applied live. Off stops (kills) the agent's browser."""
+    global AGENT_BROWSER
+    AGENT_BROWSER = bool(enabled)
+    if not AGENT_BROWSER and _agent_browser is not None:
+        _agent_browser.stop()
+
+
+def _agent_browser_call(op, fn):
+    if not AGENT_BROWSER:
+        abort(404)
+    if PAUSED:
+        return jsonify(_paused_response()), 423
+    browser = _get_agent_browser()
+    try:
+        result = fn(browser, _json_body() if request.method == "POST" else {})
+    except Exception as exc:  # BrowserError carries code/status
+        code = getattr(exc, "code", "agent_browser_error")
+        status = getattr(exc, "status", 500)
+        return jsonify({"ok": False, "error_code": code, "error": str(exc)[:300]}), status
+    log_event(f"agent browser: {op}")
+    return jsonify(dict(result, ok=True))
+
+
+@app.get("/v1/agent-browser/status")
+def agent_browser_status():
+    return _agent_browser_call("status", lambda b, _: b.status())
+
+
+@app.post("/v1/agent-browser/start")
+def agent_browser_start():
+    return _agent_browser_call("start", lambda b, _: b.start())
+
+
+@app.post("/v1/agent-browser/stop")
+def agent_browser_stop():
+    return _agent_browser_call("stop", lambda b, _: b.stop())
+
+
+@app.post("/v1/agent-browser/open")
+def agent_browser_open():
+    return _agent_browser_call("open", lambda b, body: b.open(body.get("url")))
+
+
+@app.post("/v1/agent-browser/read")
+def agent_browser_read():
+    return _agent_browser_call("read", lambda b, body: b.read(body.get("max_chars"), body.get("html") is True))
+
+
+@app.post("/v1/agent-browser/screenshot")
+def agent_browser_screenshot():
+    return _agent_browser_call("screenshot", lambda b, _: b.screenshot())
+
+
+@app.post("/v1/agent-browser/click")
+def agent_browser_click():
+    return _agent_browser_call("click", lambda b, body: b.click(body.get("selector")))
+
+
+@app.post("/v1/agent-browser/type")
+def agent_browser_type():
+    return _agent_browser_call("type", lambda b, body: b.type_text(body.get("selector"), body.get("text")))
+
+
 def _param_keys(payload, exclude=()):
     """Sorted payload key NAMES for a receipt, bounded in count and length
     (review E6: a receipt must not retain an arbitrarily large body)."""

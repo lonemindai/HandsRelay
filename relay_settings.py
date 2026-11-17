@@ -168,10 +168,15 @@ PLANNED_TOGGLES = (
         source="partner ruling 2026-11-15 (toggle); tools/smoke_inject.py reads it from settings.json",
     ),
     Setting(
-        key="nested_desktop", label="Run the agent on a separate (nested) desktop",
-        help="Optional mode: the agent works on its own desktop instead of yours.",
-        risk="Experimental mode; see docs/SPIKE-NESTED-DESKTOP.md.",
-        kind="bool", default=False, group="Agent capabilities", available=False, source=_RULED,
+        key="agent_browser_invisible", label="Give agents their own invisible browser (browser tasks only, not a full desktop)",
+        help="The agent gets a separate headless Edge/Chrome with its own profile that never appears on your screen. "
+             "It is driven over the browser's debugging protocol, not your mouse and keyboard, so you keep working. "
+             "Native Windows apps still run on your desktop.",
+        risk="Pages the agent opens are readable to it; its profile is separate from yours (no sign-ins shared). "
+             "The debugging port is local to this PC only.",
+        kind="bool", default=False, applies="live", group="Agent capabilities",
+        source="partner ruling 2026-11-15 22:32 (split: invisible browser); services/gateway/agent_browser.py "
+               "(env HANDSRELAY_AGENT_BROWSER)",
     ),
 )
 SETTINGS = SETTINGS + PLANNED_TOGGLES

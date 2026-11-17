@@ -921,6 +921,8 @@ class RelayApp:
                 gw.TRAJECTORY_TYPED_TEXT = bool(values["trajectory_record_typed_text"])
             if "custom_tools_registry" in values:
                 gw.CUSTOM_TOOLS = bool(values["custom_tools_registry"])
+            if "agent_browser_invisible" in values:
+                gw.set_agent_browser(values["agent_browser_invisible"])
         hands = self._hands_module
         if hands is not None and "paste_auto_min_chars" in values:
             hands.PASTE_AUTO_MIN_CHARS = values["paste_auto_min_chars"]
