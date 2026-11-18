@@ -91,8 +91,8 @@ def run():
         check("valid secret is not locked out",
               r.status_code == 200)
         r = client.get("/windows", headers={"X-Secret": "not-the-secret"})
-        check("bad secret from a locked-out peer is 429",
-              r.status_code == 429)
+        check("bad secret from a locked-out peer is burst 429",
+              r.status_code == 429 and r.get_json().get("error_code") == "burst")
     finally:
         hands._lockout_by_peer.pop(peer, None)
 

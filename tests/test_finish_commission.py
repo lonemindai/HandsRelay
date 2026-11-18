@@ -82,7 +82,7 @@ def test_owner_aborted_receipt_is_terminal_and_not_replayed(monkeypatch, held):
     def forward(op, payload):
         calls.append(op)
         if held and len(calls) == 1:
-            return 409, {'ok': False, 'error_code': 'yield', 'error': 'user active'}
+            return 409, {'ok': False, 'error_code': 'owner_active', 'error': 'user active'}
         return 409, abort
     monkeypatch.setattr(gw, '_forward_act', forward)
     try:

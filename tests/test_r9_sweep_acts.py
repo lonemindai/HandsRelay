@@ -8,7 +8,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = {"X-Relay-Token": "test-token"}
-YIELD = {"ok": False, "error": "user active — control yielded", "error_code": "yield"}
+YIELD = {"ok": False, "error": "user active — control yielded", "error_code": "owner_active"}
 
 
 def _load(rel, tag):
@@ -63,7 +63,7 @@ def test_yield_409_carries_foreground_hwnd(hands, monkeypatch):
         resp, status = hands._yield_if_active()
     assert status == 409
     assert resp.get_json()["foreground_hwnd"] == 42
-    assert resp.get_json()["error_code"] == "yield"
+    assert resp.get_json()["error_code"] == "owner_active"
 
 
 def test_yield_409_without_foreground_omits_hwnd(hands, monkeypatch):

@@ -19,7 +19,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = {"X-Relay-Token": "test-token"}
 BAD = {"X-Relay-Token": "not-the-token"}
-YIELD = {"ok": False, "error": "user active — control yielded", "error_code": "yield"}
+YIELD = {"ok": False, "error": "user active — control yielded", "error_code": "owner_active"}
 _seq = itertools.count()
 
 
@@ -173,7 +173,8 @@ def test_lockout_trips_on_the_tenth_failure_logs_and_alerts_once(gw, client, mon
     assert alerts == [] and gw._lockout_by_peer == {}
     assert client.get("/v1/info", headers=BAD).status_code == 401  # the 10th trips it
     assert len(alerts) == 1 and "LOCKOUT" in alerts[0][0]
-    assert client.get("/v1/info", headers=BAD).status_code == 429
+    burst = client.get("/v1/info", headers=BAD)
+    assert burst.status_code == 429 and burst.get_json()["error_code"] == "burst"
     assert client.get("/v1/info", headers=TOKEN).status_code == 200  # valid token never locked
     lines = _drain(gw.log_queue)
     assert sum("rejected request" in line for line in lines) == gw.MAX_FAILS

@@ -69,7 +69,7 @@ def test_break_yields_while_owner_active(hands, monkeypatch):
     with hands.app.test_request_context("/break", method="POST", json={}):
         resp = hands.break_()
     assert _status(resp) == 409
-    assert _body(resp)["error_code"] == "yield"
+    assert _body(resp)["error_code"] == "owner_active"
     assert calls == []
 
 
@@ -98,7 +98,7 @@ def test_yield_response_carries_error_code(hands, monkeypatch):
     ):
         resp = hands.gate()
     assert _status(resp) == 409
-    assert _body(resp)["error_code"] == "yield"
+    assert _body(resp)["error_code"] == "owner_active"
 
 
 # ------------------------------------------------------------------ F3
@@ -255,7 +255,7 @@ def test_type_completes_when_owner_stays_away(hands, monkeypatch):
 def test_yield_conflict_prefers_error_code(gateway):
     f = gateway._is_yield_conflict
     assert f(409, {"error": "desktop locked", "error_code": "locked"}) is True
-    assert f(409, {"error": "user active", "error_code": "yield"}) is True
+    assert f(409, {"error": "user active", "error_code": "owner_active"}) is True
     # The latent prose trap: text says "user active" but the code says
     # this is a hard refusal — the code wins.
     assert (
@@ -278,7 +278,7 @@ def test_yield_conflict_substring_fallback(gateway):
     assert f(409, {"error": "user active — control yielded"}) is True
     assert f(409, {"error": "desktop locked — control yielded"}) is True
     assert f(409, {"error": "boom"}) is False
-    assert f(200, {"error": "user active", "error_code": "yield"}) is False
+    assert f(200, {"error": "user active", "error_code": "owner_active"}) is False
     assert f(409, {"error": None}) is False
 
 
@@ -390,7 +390,7 @@ def test_queued_yield_still_holds_with_payload(gateway, monkeypatch):
             {
                 "ok": False,
                 "error": "user active — control yielded",
-                "error_code": "yield",
+                "error_code": "owner_active",
             },
         ),
     )

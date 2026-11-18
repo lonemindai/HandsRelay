@@ -384,7 +384,7 @@ def test_act_gives_way_to_the_owner(gw_on):
     act = {"holder": "muse", "tab_id": "T1", "op": "click", "selector": "#go"}
     gw_on.idle["v"] = 1.0
     r = c.post("/v1/dom/act", json=act, headers=H)
-    assert r.status_code == 409 and r.get_json()["error_code"] == "yield"
+    assert r.status_code == 409 and r.get_json()["error_code"] == "owner_active"
     gw_on.idle["v"] = None
     r = c.post("/v1/dom/act", json=act, headers=H)
     assert r.status_code == 503 and r.get_json()["error_code"] == "owner_state_unknown"

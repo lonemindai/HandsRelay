@@ -90,7 +90,7 @@ def test_on_runs_in_order(gw, monkeypatch):
 def test_on_stops_when_owner_takes_over(gw, monkeypatch):
     def script(op, p, i):
         if i == 1:
-            return 409, {"ok": False, "error_code": "yield", "error": "yield: user active"}
+            return 409, {"ok": False, "error_code": "owner_active", "error": "yield: user active"}
         return 200, {"ok": True}
     forward, calls = _fake_forward(script)
     monkeypatch.setattr(gw, "_forward_act", forward)

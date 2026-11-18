@@ -348,7 +348,7 @@ def _yield_if_active():
         body = {
             "ok": False,
             "error": "user active — control yielded",
-            "error_code": "yield",
+            "error_code": "owner_active",
         }
         # R9 (#20): the window this act was aimed at, captured at the
         # first (yielded) attempt, so the gateway can pin the held
@@ -528,7 +528,7 @@ def gate():
     provided = request.headers.get("X-Secret") or ""
     decision, tripped = _auth_decide(provided)
     if decision == "locked":
-        return jsonify({"ok": False, "error": "locked out"}), 429
+        return jsonify({"ok": False, "error": "locked out", "error_code": "burst"}), 429
     if decision != "ok":
         file_log("bad secret attempt")
         if tripped:

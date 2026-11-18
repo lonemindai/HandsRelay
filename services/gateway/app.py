@@ -630,7 +630,7 @@ def gate():
     provided = request.headers.get("X-Relay-Token") or ""
     decision, tripped = _gate_decision(provided)
     if decision == "locked":
-        return jsonify({"ok": False, "error": "locked out"}), 429
+        return jsonify({"ok": False, "error": "locked out", "error_code": "burst"}), 429
     if decision != "ok":
         peer = _peer_key()
         log_event(f"rejected request to {request.path} from {peer} (bad gateway token)")
@@ -1531,7 +1531,7 @@ def _is_yield_conflict(status, result):
     """Classify a hands 409 as a WP0b yield (hold and retry) or not.
 
     R4 (F11): the hands' structured error_code is authoritative when
-    present ("yield" = owner active, "locked" = desktop locked; both
+    present ("owner_active" = owner active, "locked" = desktop locked; both
     mean hold and retry). The substring match on the human prose is
     only a fallback for an older hands that predates the code —
     rewording an error message must not silently reclassify holds as
@@ -1541,7 +1541,7 @@ def _is_yield_conflict(status, result):
         return False
     code = result.get("error_code")
     if code is not None:
-        return code in ("yield", "locked")
+        return code in ("owner_active", "burst", "locked")
     error = str(result.get("error") or "").lower()
     return "yield" in error or "user active" in error
 
@@ -1836,6 +1836,7 @@ def _claim_gate_act(op, payload, path=None):
     if claim is not None and claim["holder"] != holder and _is_yield_conflict(status, result):
         info = _claim_info(claim, time.time())
         result = dict(result)
+        result["error_code"] = "claim_held"
         result["claim_held_by"] = info["holder"]
         result["claim_info"] = info
         result["error"] = f"{result.get('error', 'yielded')}; note: {_claim_held_message(info)}"
@@ -2919,7 +2920,7 @@ def _dom_refusal(act=False, holder=""):
         return {
             "ok": False,
             "error": "user active: giving way to the PC owner",
-            "error_code": "yield",
+            "error_code": "owner_active",
             "owner_idle_seconds": idle,
         }, 409
     return None

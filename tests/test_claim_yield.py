@@ -76,10 +76,10 @@ def test_holder_act_forwarded_without_holder_field(gw):
 def test_unnamed_caller_yield_names_the_holder(gw):
     c = gw.app.test_client()
     _claim(c, "agent:muse:main")
-    gw._hands_answer = (409, {"ok": False, "error": "user active — control yielded", "error_code": "yield"})
+    gw._hands_answer = (409, {"ok": False, "error": "user active — control yielded", "error_code": "owner_active"})
     r = c.post("/v1/act", json={"op": "click", "x": 1, "y": 2}, headers=H)
     body = r.get_json()
-    assert r.status_code == 409 and body["error_code"] == "yield"  # queued-retry contract kept
+    assert r.status_code == 409 and body["error_code"] == "claim_held"  # held claim explains the yield
     assert body["claim_held_by"] == "agent:muse:main"
     assert "claimed by 'agent:muse:main'" in body["error"]
 
