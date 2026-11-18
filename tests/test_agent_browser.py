@@ -340,9 +340,10 @@ def test_off_is_byte_for_byte_the_base_gateway(monkeypatch, tmp_path):
     old_rules = {r.rule for r in _gateway(monkeypatch, old_path).app.url_map.iter_rules()}
     new_rules = {r.rule for r in _gateway(monkeypatch).app.url_map.iter_rules()}
     # Routes of the other toggles merged into v4-rc1 after 925f9be (uia, dom)
-    # are covered by their own byte-for-byte tests.
+    # are covered by their own byte-for-byte tests; claim-yield (2026-11-16)
+    # adds the read-only claim status route.
     other = {r for r in new_rules if r.startswith(("/v1/uia/", "/v1/dom/"))}
-    assert new_rules - old_rules - other == {p for _, p in ROUTES}
+    assert new_rules - old_rules - other - {"/v1/hands/claim/status"} == {p for _, p in ROUTES}
 
 
 @pytest.fixture

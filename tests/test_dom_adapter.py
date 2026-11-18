@@ -331,7 +331,8 @@ def test_off_is_byte_for_byte_the_old_gateway(monkeypatch, tmp_path):
     assert new == old
     old_rules = {r.rule for r in _gateway(monkeypatch, old_path).app.url_map.iter_rules()}
     new_rules = {r.rule for r in _gateway(monkeypatch).app.url_map.iter_rules()}
-    assert new_rules - old_rules == {"/v1/dom/tabs", "/v1/dom/snapshot", "/v1/dom/act"}
+    # claim-yield (2026-11-16) adds the read-only claim status route.
+    assert new_rules - old_rules == {"/v1/dom/tabs", "/v1/dom/snapshot", "/v1/dom/act", "/v1/hands/claim/status"}
 
 
 @pytest.fixture

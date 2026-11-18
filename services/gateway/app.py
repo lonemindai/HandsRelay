@@ -81,6 +81,12 @@ _probe_cache = {"hands": None, "parser": None, "pc_state": None, "at": 0.0}
 # Advisory only: sessions read the claim before driving the desktop, but
 # /v1/act is deliberately NOT gated on it — the claim coordinates polite
 # agents, it is not an access control (the gateway token is that).
+# Exception (wishlist claim-yield, 2026-11-16): a caller that NAMES itself
+# ("holder" in the act body or X-Hands-Holder) is refused with an explicit
+# claim_held 409 when someone else holds the claim; unnamed callers keep
+# the advisory behaviour but any yield-409 carries the holder's details.
+# GET /v1/hands/claim[/status] is read-only and reports age/expiry/stale;
+# a stale claim (unrefreshed for CLAIM_TTL_DEFAULT s) may be force-released.
 # State is in-memory and lock-guarded, with LAZY expiry: an expired claim
 # is treated as absent the next time anything looks, via _current_claim.
 # ---------------------------------------------------------------------------
@@ -115,6 +121,9 @@ _claim = None  # {"holder", "purpose", "since", "expires_at"} or None
 _claim_queue = []  # FIFO of {"holder", "purpose", "enqueued_at", "refreshed_at"}
 _reserved_for = None  # queue head holder with an exclusive claim window
 _reserved_until = 0.0
+# Last grant/refresh time of the live claim, kept OUT of the claim dict so
+# every existing response stays byte-identical (staleness, claim-yield).
+_claim_refreshed_at = None
 
 
 # R11: the hands' resting-hand float runs only while a claim is held, and
@@ -357,6 +366,42 @@ def _current_claim(now=None):
     with _claim_lock:
         current = _current_claim_locked(now)
         return dict(current) if current is not None else None
+
+
+def _claim_info(claim, now):
+    """Wishlist claim-yield: a readable view of a live claim -- holder,
+    age, idle since last refresh, expiry and whether it is STALE. A claim
+    is stale when its holder has not refreshed it for CLAIM_TTL_DEFAULT
+    seconds (an expired claim is already gone: expiry is lazy). A stale
+    claim may be force-released by anyone (POST /v1/hands/release
+    {holder, force: true}); a fresh one only by its holder."""
+    if not claim:
+        return None
+    since = float(claim.get("since", now))
+    refreshed = _claim_refreshed_at if _claim_refreshed_at is not None else since
+    refreshed = max(float(refreshed), since)
+    expires_at = float(claim.get("expires_at", now))
+    idle = max(0.0, now - refreshed)
+    return {
+        "holder": claim.get("holder"),
+        "purpose": claim.get("purpose", ""),
+        "since": since,
+        "age_s": round(max(0.0, now - since), 1),
+        "idle_s": round(idle, 1),
+        "expires_at": expires_at,
+        "expires_in_s": round(max(0.0, expires_at - now), 1),
+        "stale_after_s": CLAIM_TTL_DEFAULT,
+        "stale": idle >= CLAIM_TTL_DEFAULT,
+    }
+
+
+def _claim_held_message(info):
+    return (
+        f"hands claimed by {info['holder']!r} (claim age {info['age_s']:.0f}s, "
+        f"expires in {info['expires_in_s']:.0f}s"
+        + (", STALE: force-release allowed" if info["stale"] else "")
+        + ")"
+    )
 
 
 def _claim_snapshot(now=None):
@@ -769,9 +814,26 @@ def hands_claim_status():
     return jsonify({"ok": True, "claim": claim, "queue": queue, "reserved_for": reserved})
 
 
+@app.get("/v1/hands/claim/status")
+def hands_claim_status_detail():
+    """Read-only claim status with holder, age, expiry and staleness:
+    never grants, refreshes or releases."""
+    now = time.time()
+    claim, queue, reserved = _claim_snapshot(now)
+    return jsonify(
+        {
+            "ok": True,
+            "claim": claim,
+            "claim_info": _claim_info(claim, now),
+            "queue": queue,
+            "reserved_for": reserved,
+        }
+    )
+
+
 @app.post("/v1/hands/claim")
 def hands_claim():
-    global _claim, _reserved_for, _reserved_until
+    global _claim, _reserved_for, _reserved_until, _claim_refreshed_at
     body = _json_body()
     holder = str(body.get("holder") or "").strip()[:HOLDER_MAX_CHARS]
     if not holder:
@@ -793,6 +855,7 @@ def hands_claim():
             # Same holder re-claiming refreshes the lease.
             current["purpose"] = purpose or current["purpose"]
             current["expires_at"] = now + ttl
+            _claim_refreshed_at = now
             _push_claim_locked(current, now)
             return jsonify({"ok": True, "granted": True, "claim": dict(current)})
         if current is not None:
@@ -809,12 +872,15 @@ def hands_claim():
                         "claim": dict(current),
                     }
                 )
+            info = _claim_info(current, now)
             return (
                 jsonify(
                     {
                         "ok": False,
-                        "error": f"hands already claimed by {current['holder']!r}",
+                        "error": _claim_held_message(info),
+                        "error_code": "claim_held",
                         "claim": dict(current),
+                        "claim_info": info,
                     }
                 ),
                 409,
@@ -865,6 +931,7 @@ def hands_claim():
             "since": now,
             "expires_at": now + ttl,
         }
+        _claim_refreshed_at = now
         _push_claim_locked(_claim, now)
         return jsonify({"ok": True, "granted": True, "claim": dict(_claim)})
 
@@ -909,28 +976,53 @@ def hands_release():
                     "reserved_for": reserved,
                 }
             )
+        forced_from = None
         if current["holder"] != holder:
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "only the current holder can release the claim",
-                        "claim": dict(current),
-                    }
-                ),
-                403,
-            )
+            info = _claim_info(current, now)
+            if body.get("force") is not True:
+                return (
+                    jsonify(
+                        {
+                            "ok": False,
+                            "error": "only the current holder can release the claim"
+                            + (" (it is STALE: pass force: true to release it)" if info["stale"] else ""),
+                            "error_code": "not_holder",
+                            "claim": dict(current),
+                            "claim_info": info,
+                        }
+                    ),
+                    403,
+                )
+            if not info["stale"]:
+                return (
+                    jsonify(
+                        {
+                            "ok": False,
+                            "error": f"force release refused: the claim is not stale (idle {info['idle_s']:.0f}s "
+                            f"< {CLAIM_TTL_DEFAULT}s); {_claim_held_message(info)}",
+                            "error_code": "claim_not_stale",
+                            "claim": dict(current),
+                            "claim_info": info,
+                        }
+                    ),
+                    409,
+                )
+            forced_from = current["holder"]
         _claim = None
         _push_claim_locked(None, now)
         _reserve_head_locked(now)
-        return jsonify(
-            {
-                "ok": True,
-                "released": True,
-                "claim": None,
-                "reserved_for": _reserved_for,
-            }
-        )
+        out = {
+            "ok": True,
+            "released": True,
+            "claim": None,
+            "reserved_for": _reserved_for,
+        }
+        if forced_from is not None:
+            out["forced"] = True
+            out["released_holder"] = forced_from
+    if forced_from is not None:
+        log_event(f"stale claim held by {forced_from!r} force-released by {holder!r}")
+    return jsonify(out)
 
 
 @app.post("/v1/parse")
@@ -1695,9 +1787,58 @@ def _forward_act(op, payload, path=None):
     recording toggle is on, append it to the local recording. Every act
     path (/v1/act, /v1/act/queued and its retry pump, /v1/act/batch)
     comes through here."""
-    status, result = _forward_act_once(op, payload, path=path)
+    status, result = _claim_gate_act(op, payload, path=path)
     if TRAJECTORY_RECORDING:
         _trajectory_record(op, payload, status, result)
+    return status, result
+
+
+def _act_holder(payload):
+    """(payload without 'holder', declared holder or ''). The caller may
+    name itself in the body ("holder") or the X-Hands-Holder header."""
+    holder = ""
+    if isinstance(payload, dict) and "holder" in payload:
+        payload = dict(payload)
+        holder = str(payload.pop("holder") or "")
+    if not holder:
+        try:
+            holder = request.headers.get("X-Hands-Holder", "") or ""
+        except RuntimeError:  # retry pump: no request context
+            holder = ""
+    return payload, holder.strip()[:HOLDER_MAX_CHARS]
+
+
+def _claim_gate_act(op, payload, path=None):
+    """Wishlist claim-yield (muse 2026-11-16): a claim held by someone
+    else must never look like a bare 'yield'.
+
+    * A caller that names itself (holder) and is not the claim holder is
+      refused BEFORE the hands is touched: 409 error_code "claim_held",
+      naming the holder, the claim age and the expiry.
+    * Any hands yield-409 while a claim is held by another (or by an
+      unnamed caller's someone) carries the same claim details, so the
+      refusal is explicit even for callers that do not name themselves.
+    Callers that do not name themselves are otherwise unchanged (the
+    claim stays advisory for them)."""
+    payload, holder = _act_holder(payload)
+    now = time.time()
+    claim = _current_claim(now)
+    if claim is not None and holder and claim["holder"] != holder and not PAUSED:
+        info = _claim_info(claim, now)
+        return 409, {
+            "ok": False,
+            "error": _claim_held_message(info) + " -- act refused, not forwarded",
+            "error_code": "claim_held",
+            "claim": claim,
+            "claim_info": info,
+        }
+    status, result = _forward_act_once(op, payload, path=path)
+    if claim is not None and claim["holder"] != holder and _is_yield_conflict(status, result):
+        info = _claim_info(claim, time.time())
+        result = dict(result)
+        result["claim_held_by"] = info["holder"]
+        result["claim_info"] = info
+        result["error"] = f"{result.get('error', 'yielded')}; note: {_claim_held_message(info)}"
     return status, result
 
 
