@@ -3480,16 +3480,16 @@ def bind_claim_authority(directory=None):
     """Allocate this process's epoch before any claim traffic is served.
 
     Failure is fail-closed: the process does not start. The directory is
-    the argument, else MUSE_RELAY_STATE_DIR, else services/gateway/state
+    the argument, else HANDS_RELAY_STATE_DIR, else services/gateway/state
     beside this file. The returned store stays held until release().
     """
     global _claim_authority
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "epoch_store.py")
-    spec = importlib.util.spec_from_file_location("muse_gateway_epoch_store", path)
+    spec = importlib.util.spec_from_file_location("hands_gateway_epoch_store", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if directory is None:
-        directory = os.environ.get("MUSE_RELAY_STATE_DIR") or os.path.join(
+        directory = os.environ.get("HANDS_RELAY_STATE_DIR") or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "state")
     store = module.EpochStore(directory)
     try:
