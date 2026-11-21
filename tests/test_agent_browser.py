@@ -336,7 +336,8 @@ def test_off_is_byte_for_byte_the_base_gateway(monkeypatch, tmp_path):
         return [(r.status_code, r.get_data(), sorted((k, v) for k, v in r.headers if k != "Date"))
                 for r in (getattr(c, m)(p, json=b, headers=H) for m, p, b in script)]
 
-    assert run(_gateway(monkeypatch)) == run(_gateway(monkeypatch, old_path))
+    from r13_contract import compare
+    compare([p for _, p, _ in script], run(_gateway(monkeypatch)), run(_gateway(monkeypatch, old_path)))
     old_rules = {r.rule for r in _gateway(monkeypatch, old_path).app.url_map.iter_rules()}
     new_rules = {r.rule for r in _gateway(monkeypatch).app.url_map.iter_rules()}
     # Routes of the other toggles merged into v4-rc1 after 925f9be (uia, dom)

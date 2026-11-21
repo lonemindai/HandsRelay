@@ -226,12 +226,18 @@ class _Resp:
 
 
 def _fake_requests(mod, log):
+    # Speaks the R13 execution lease like a current hands; older
+    # gateways never ask, so the base comparison is unaffected.
     def post(url, json=None, headers=None, timeout=None):
         log.append(("POST", url, json))
+        if url.endswith("/execution/lease"):
+            return _Resp(200, {"ok": True, "lease": {"version": 1, "boot": "b", "token": "t"}})
         return _Resp(200, {"ok": True, "echo": json})
 
     def get(url, headers=None, timeout=None):
         log.append(("GET", url))
+        if url.endswith("/execution/capabilities"):
+            return _Resp(200, {"ok": True, "execution_lease_version": 1, "boot": "b"})
         return _Resp(200, {"ok": True, "windows": []})
 
     mod.requests.post = post
@@ -283,8 +289,15 @@ def test_gateway_off_is_byte_for_byte_the_base(tmp_path, monkeypatch):
                     data.pop(volatile, None)
                 if isinstance(data.get("claim"), dict):
                     data["claim"] = {k: v for k, v in data["claim"].items()
-                                     if k not in ("since", "expires_at", "expires_in")}
+                                     if k not in ("since", "expires_at", "expires_in", "id")}  # R13 claim id
+                if p in ("/v1/act", "/v1/act/queued"):
+                    # R13: bounded diagnostics, not the hands echo
+                    data = {k: v for k, v in data.items() if k == "ok"}
                 res.append((p, r.status_code, sorted(data.items(), key=str)))
+            # R13: queued acts negotiate a boot-bound lease first
+            log = [entry for entry in log if "/execution/" not in str(entry)]
+            log = [(e[0], e[1], {k: v for k, v in e[2].items() if k != "_execution_lease"})
+                   if len(e) == 3 and isinstance(e[2], dict) else e for e in log]
             outs.append((res, log))
             gw.stop_background()
         finally:

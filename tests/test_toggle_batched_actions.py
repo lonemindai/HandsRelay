@@ -66,7 +66,7 @@ def test_off_leaves_single_act_unchanged(gw, monkeypatch):
     monkeypatch.setattr(gw, "_forward_act", forward)
     c = gw.app.test_client()
     r = c.post("/v1/act", json={"op": "click", "x": 1}, headers=TOKEN)
-    assert r.status_code == 200 and r.get_json() == {"ok": True, "op": "click"}
+    assert r.status_code == 200 and r.get_json() == {"ok": True}  # R13: bounded diagnostics, no hands echo
     assert calls == [("click", {"x": 1})]
 
 

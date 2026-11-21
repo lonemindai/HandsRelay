@@ -31,7 +31,7 @@ def test_recent_owner_event_yields_and_quiet_self_span_does_not(hands, monkeypat
     with module.app.app_context():
         refused = module._yield_if_active()
     assert refused[1] == 409
-    assert refused[0].get_json()["error_code"] == "yield"
+    assert refused[0].get_json()["error_code"] == "owner_active"  # v4 yield-reason name
     clock["t"] += 10.0
     with module.app.app_context():
         assert module._yield_if_active() is None

@@ -27,7 +27,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app as gateway  # noqa: E402
 
 TOKEN = {"X-Relay-Token": "test-token"}
-YIELD_409 = (409, {"ok": False, "error": "hands yielded: user active on the desktop"})
+# R13: only a coded refusal is held (an uncoded 409 cannot prove zero
+# effect); v4 names the owner-at-the-desk code "owner_active".
+YIELD_409 = (409, {"ok": False, "error": "hands yielded: user active on the desktop",
+                   "error_code": "owner_active"})
 
 
 class ActStub:
@@ -209,8 +212,9 @@ def run():
     # Plain /v1/act still routes through the shared forward, untouched.
     gateway._forward_act = ActStub([(200, {"ok": True, "plain": True})])
     r = client.post("/v1/act", json={"op": "move", "x": 5, "y": 6}, headers=TOKEN)
-    check("plain /v1/act is unchanged (200 passthrough, no receipt)",
-          r.status_code == 200 and r.get_json() == {"ok": True, "plain": True}
+    # R13: /v1/act answers bounded diagnostics, not the hands echo.
+    check("plain /v1/act is unchanged (200 bounded, no receipt)",
+          r.status_code == 200 and r.get_json() == {"ok": True}
           and client.get("/v1/act/queued", headers=TOKEN).get_json()["receipts"] == [])
 
     # (a) Immediate non-409 -> passthrough + receipt id, and a settled
@@ -222,7 +226,7 @@ def run():
     direct_id = body.get("id")
     check("queued act passes an immediate 200 through with its receipt id",
           r.status_code == 200 and body.get("ok") is True
-          and body.get("moved") is True
+          and "moved" not in body  # R13 bounded
           and isinstance(direct_id, str) and len(direct_id) == 32)
     r = client.get("/v1/act/queued", headers=TOKEN)
     receipts = r.get_json()["receipts"]
@@ -261,7 +265,7 @@ def run():
     gateway._pump_receipt(receipt, time.time())
     check("pump settles held -> applied on the first non-409",
           receipt["state"] == "applied" and receipt["hands_status"] == 200
-          and receipt["result"] == {"ok": True, "typed": True})
+          and receipt["result"] == {"ok": True})  # R13 bounded
 
     # (e) The typed value appears NOWHERE in the receipt JSON.
     r = client.get(f"/v1/act/queued/{receipt_id}", headers=TOKEN)
@@ -312,12 +316,14 @@ def run():
     check("pump settles held -> failed when the hands are unreachable",
           receipt3["state"] == "failed" and receipt3["hands_status"] == 502)
 
-    # (d) Unknown receipt id -> 404 with state expired.
+    # (d) Unknown receipt id -> 404 with state unavailable (R13).
     r = client.get("/v1/act/queued/deadbeefdeadbeef", headers=TOKEN)
     body = r.get_json()
-    check("unknown receipt id is 404 with state expired",
+    # R13: an unknown id says "unavailable" (it may never have existed;
+    # execution cannot be inferred), not "expired".
+    check("unknown receipt id is 404 with state unavailable",
           r.status_code == 404 and body["ok"] is False
-          and body["state"] == "expired")
+          and body["state"] == "unavailable")
 
     # Receipt list: newest first, summary fields only.
     r = client.get("/v1/act/queued", headers=TOKEN)

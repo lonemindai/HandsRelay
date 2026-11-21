@@ -30,7 +30,9 @@ def test_abort_polling_list_and_dashboard(monkeypatch, reason, state):
     assert app.receipt_state_counts(snap) == {state: 1}
     assert app.summarize_receipts(snap, 100)[0]['state'] == state
     js = (ROOT / 'ui/app.js').read_text()
-    assert (f'"{state}": "chip-bad"' in js or f'{state}: "chip-bad"' in js)
+    # v4 #35: an owner takeover is not a failure -- its own amber chip.
+    chip = "chip-owner" if state == "aborted-owner" else "chip-bad"
+    assert (f'"{state}": "{chip}"' in js or f'{state}: "{chip}"' in js)
 
 
 def test_evicted_receipt_is_unavailable_not_unexecuted():

@@ -55,7 +55,7 @@ def test_settings_registered():
 def test_off_writes_nothing_and_responses_unchanged(gw, tmp_path):
     c = gw.app.test_client()
     r = c.post("/v1/act", json={"op": "type", "text": "secret"}, headers=TOKEN)
-    assert r.status_code == 200 and r.get_json() == {"ok": True, "op": "type"}
+    assert r.status_code == 200 and r.get_json() == {"ok": True}  # R13: bounded diagnostics, no hands echo
     s = c.get("/v1/screen", headers=TOKEN)
     assert s.get_data() == b"\x89PNG-fake"
     assert not (tmp_path / "traj").exists()
@@ -65,7 +65,7 @@ def test_on_records_acts_redacted_and_screens(gw, tmp_path):
     gw.TRAJECTORY_RECORDING = True
     c = gw.app.test_client()
     r = c.post("/v1/act", json={"op": "type", "text": "hunter2"}, headers=TOKEN)
-    assert r.get_json() == {"ok": True, "op": "type"}  # the act's answer is unchanged
+    assert r.get_json() == {"ok": True}  # the act's answer is unchanged (R13 bounded form)
     c.post("/v1/act", json={"op": "click", "x": 3, "y": 4}, headers=TOKEN)
     c.get("/v1/screen", headers=TOKEN)
     lines = _lines(tmp_path)

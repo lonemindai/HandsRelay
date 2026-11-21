@@ -1940,7 +1940,41 @@ def _held_failure_diagnostics(result):
         safe.pop("chars_typed")
     if isinstance(result.get("aborted"), bool):
         safe["aborted"] = result["aborted"]
+    _copy_gateway_refusal(result, safe)
     return safe
+
+
+def _bounded_scalars(value, limit=16):
+    if not isinstance(value, dict):
+        return None
+    out = {}
+    for key, item in list(value.items())[:limit]:
+        if not isinstance(key, str):
+            continue
+        if isinstance(item, str):
+            out[key[:64]] = item[:HOLDER_MAX_CHARS]
+        elif item is None or isinstance(item, (bool, int)) or (
+                isinstance(item, float) and math.isfinite(item)):
+            out[key[:64]] = item
+    return out
+
+
+def _copy_gateway_refusal(result, safe):
+    """v4 claim-yield / owner pause: refusals the GATEWAY wrote (never the
+    hands, never request payload) keep their explanation -- who holds the
+    claim, its age and expiry, or that the owner paused the relay."""
+    code = result.get("error_code")
+    if code not in ("claim_held", "paused"):
+        return
+    safe["error_code"] = code
+    if isinstance(result.get("error"), str):
+        safe["error"] = result["error"][:400]
+    if isinstance(result.get("claim_held_by"), str):
+        safe["claim_held_by"] = result["claim_held_by"][:HOLDER_MAX_CHARS]
+    for key in ("claim_info", "claim"):
+        bounded = _bounded_scalars(result.get(key))
+        if bounded is not None:
+            safe[key] = bounded
 
 
 def classify_act_outcome(status, result):
@@ -2005,6 +2039,15 @@ def _attempt_act(op, payload):
     return state, status, safe, result
 
 
+def _wall_deadline_passed(receipt, now):
+    """Review E2 (v4): the pump's caller-supplied wall clock also bounds a
+    hold. R13's monotonic deadline guards against clock jumps; either one
+    lapsing settles the receipt, so a hold can end early but never late."""
+    wall = receipt.get("deadline")
+    return (type(wall) in (int, float) and type(now) in (int, float)
+            and math.isfinite(wall) and now >= wall)
+
+
 def _pump_receipt(receipt, now):
     """One retry step for a held receipt. Returns the receipt.
 
@@ -2029,7 +2072,7 @@ def _pump_receipt(receipt, now):
         deadline = receipt.get("_deadline_mono", receipt.get("deadline"))
         current = time.monotonic() if "_deadline_mono" in receipt else now
         if (type(deadline) not in (int, float) or not math.isfinite(deadline)
-                or current >= deadline):
+                or current >= deadline or _wall_deadline_passed(receipt, now)):
             receipt.update(state="refused-yielded", updated_at=time.time(),
                            result={"ok": False, "error_code": "deadline_expired"})
             _pending_payloads.pop(receipt["id"], None)
@@ -2055,7 +2098,8 @@ def _pump_receipt(receipt, now):
         if yielded:
             current = (time.monotonic() if "_deadline_mono" in receipt
                        else now + (time.monotonic() - attempt_started))
-            if current >= deadline:
+            if current >= deadline or _wall_deadline_passed(
+                    receipt, now + (time.monotonic() - attempt_started)):
                 receipt["state"] = "refused-yielded"
                 receipt["result"] = {"ok": False, "error_code": "deadline_expired"}
                 _pending_payloads.pop(receipt["id"], None)

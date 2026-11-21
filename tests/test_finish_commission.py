@@ -27,48 +27,72 @@ def hands(monkeypatch):
     mod.stop_background()
 
 
-@pytest.mark.parametrize('owner_at,expected_chars', [(0, 0), (1, 130), (None, 130)])
-def test_paste_guard_before_and_after_injection(hands, monkeypatch, owner_at, expected_chars):
+# R13 B10 (paste redesign) supersedes the v4 finish-commission paste
+# guard: the owner is sampled before the clipboard write and again before
+# the chord; once Ctrl+V is sent the paste is atomic and reported applied
+# (no post-chord "abort" that would misstate delivered text). These are
+# the v4 behaviours restated on that contract.
+def _post(hands, payload):
+    hands.SHARED_SECRET = 's'
+    return hands.app.test_client().post('/type', headers={'X-Secret': 's'}, json=payload)
+
+
+class _Clip:
+    def __init__(self):
+        self.text = 'original'
+    def get_text(self):
+        return self.text
+    def set_text(self, value):
+        self.text = value
+
+
+@pytest.mark.parametrize('owner_at', [0, 1, 2, None])
+def test_paste_guard_before_and_after_injection(hands, monkeypatch, owner_at):
+    # owner_at: the guard sample at which the owner shows up.
+    # 0 = before the clipboard write, 1 = before the chord, 2+ = after it.
     samples = []
     calls = []
-    clipboard = ['original']
-    class Guard:
-        mode = 'hook'
-        def sample(self):
-            index = len(samples)
-            samples.append(index)
-            return index == owner_at
-        def after_write(self):
-            pass
-    monkeypatch.setattr(hands, '_TypeOwnerGuard', Guard)
-    monkeypatch.setattr(hands, '_clipboard_backend', lambda: SimpleNamespace(
-        get_text=lambda: clipboard[0], set_text=lambda value: clipboard.__setitem__(0, value)))
+    clip = _Clip()
+    real_sample = hands._TypeOwnerGuard.sample
+    def sample(self):
+        index = len(samples)
+        samples.append(index)
+        if index == owner_at:
+            self.owner_seen = True
+        return real_sample(self) if not self.owner_seen else True
+    monkeypatch.setattr(hands._TypeOwnerGuard, 'sample', sample)
+    monkeypatch.setattr(hands, '_owner_input_snapshot', lambda: (0, 0))
+    monkeypatch.setattr(hands, '_clipboard_backend', lambda: clip)
     monkeypatch.setattr(hands.pyautogui, 'hotkey', lambda *keys: calls.append(keys))
-    with hands.app.test_request_context('/type', method='POST', json={'text': 'x' * 130, 'method': 'auto'}):
-        result = hands.type_text()
-    response, status = result if isinstance(result, tuple) else (result, 200)
+    monkeypatch.setattr(hands.pyautogui, 'write', lambda *a, **k: pytest.fail('typed instead of pasting'))
+    monkeypatch.setattr(hands.time, 'sleep', lambda _s: None)
+    response = _post(hands, {'text': 'x' * 130, 'method': 'auto'})
     data = response.get_json()
-    assert status == (200 if owner_at is None else 409)
-    assert data['method_used'] == 'paste'
-    assert data['owner_guard'] == 'hook'
-    assert len(calls) == (0 if owner_at == 0 else 1)
-    assert clipboard == ['original']
-    if owner_at is not None:
-        assert data['abort_reason'] == 'owner'
-        assert data['chars_typed'] == expected_chars
+    assert clip.text == 'original'
+    assert 'chars_typed' not in data or data['chars_typed'] in (0, 130)
+    if owner_at in (0, 1):
+        assert response.status_code == 409
+        assert calls == []
+        if owner_at == 1:
+            assert data['error_code'] == 'paste_aborted' and data['injected'] is False
+            assert data['abort_reason'] == 'owner'
+        else:
+            assert data['error_code'] == 'owner_active'
+    else:
+        assert response.status_code == 200
+        assert data['method_used'] == 'paste'
+        assert data['owner_guard'] == 'hook'
+        assert len(calls) == 1
 
 
 def test_paste_refuses_changed_foreground(hands, monkeypatch):
-    handles = iter([10, 11])
-    monkeypatch.setattr(hands, '_foreground_hwnd', lambda: next(handles))
-    monkeypatch.setattr(hands, '_clipboard_backend', lambda: SimpleNamespace(get_text=lambda: 'original', set_text=lambda value: None))
+    monkeypatch.setattr(hands, '_foreground_window', lambda: {'hwnd': 11, 'title': 'other'})
+    monkeypatch.setattr(hands, '_clipboard_backend', lambda: _Clip())
     calls = []
     monkeypatch.setattr(hands.pyautogui, 'hotkey', lambda *args: calls.append(args))
-    with hands.app.test_request_context('/type', method='POST', json={'text':'x'*130}):
-        response, status = hands.type_text()
-    assert status == 409
-    assert response.get_json()['abort_reason'] == 'foreground'
-    assert response.get_json()['chars_typed'] == 0
+    response = _post(hands, {'text': 'x' * 130, 'expect_focus': {'hwnd': 10}})
+    assert response.status_code == 409
+    assert response.get_json()['error_code'] == 'foreground_changed'
     assert not calls
 
 
@@ -78,7 +102,7 @@ def test_owner_aborted_receipt_is_terminal_and_not_replayed(monkeypatch, held):
     gw.TOKEN = 'test-token'
     monkeypatch.setattr(gw, '_ensure_receipt_thread', lambda: None)
     calls = []
-    abort = {'ok': False, 'error_code': 'type_aborted', 'abort_reason': 'owner', 'chars_typed': 130}
+    abort = {'ok': False, 'aborted': True, 'error_code': 'type_aborted', 'abort_reason': 'owner', 'chars_typed': 130}  # R13 hands wire
     def forward(op, payload):
         calls.append(op)
         if held and len(calls) == 1:
@@ -152,14 +176,18 @@ def test_upgrade_reuses_legacy_credential_file(monkeypatch, tmp_path, kind):
 def test_paste_lock_after_injection_is_not_reported_as_abort(hands, monkeypatch):
     # The paste is atomic: once Ctrl+V is sent, a later lock does not undo
     # the delivered text, so the reply must not invite a duplicate retry.
-    locks = iter([False, True, True])
-    monkeypatch.setattr(hands, '_probe_locked', lambda: next(locks, True))
-    monkeypatch.setattr(hands, '_clipboard_backend', lambda: SimpleNamespace(get_text=lambda: 'original', set_text=lambda value: None))
+    locked = {'now': False}
+    monkeypatch.setattr(hands, '_probe_locked', lambda: locked['now'])
+    monkeypatch.setattr(hands, '_probe_lock_state', lambda: (locked['now'], 30.0))
+    monkeypatch.setattr(hands, '_owner_input_snapshot', lambda: (0, 0))
+    monkeypatch.setattr(hands, '_clipboard_backend', lambda: _Clip())
+    monkeypatch.setattr(hands.time, 'sleep', lambda _s: None)
     calls = []
-    monkeypatch.setattr(hands.pyautogui, 'hotkey', lambda *args: calls.append(args))
-    with hands.app.test_request_context('/type', method='POST', json={'text': 'x' * 130}):
-        result = hands.type_text()
-    response, status = result if isinstance(result, tuple) else (result, 200)
-    assert status == 200
+    def chord(*args):
+        calls.append(args)
+        locked['now'] = True
+    monkeypatch.setattr(hands.pyautogui, 'hotkey', chord)
+    response = _post(hands, {'text': 'x' * 130})
+    assert response.status_code == 200
     assert response.get_json()['method_used'] == 'paste'
     assert len(calls) == 1

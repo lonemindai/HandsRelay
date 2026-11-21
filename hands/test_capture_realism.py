@@ -282,10 +282,11 @@ def run():
         fake_time.sleeps.clear()
         r = client.post("/type", json={"text": "hello", "jitter": False}, headers=AUTH)
         check(
-            "jitter=false: single legacy write, no per-char sleeps",
+            # R13 B10: one guarded key loop; jitter=false = fixed 0.02 s pauses
+            "jitter=false: one guarded write per char, fixed 0.02 s pauses",
             r.status_code == 200
-            and calls["write"] == [(("hello",), {"interval": 0.02})]
-            and fake_time.sleeps == [],
+            and calls["write"] == [((c,), {}) for c in "hello"]
+            and fake_time.sleeps == [0.02] * 5,
         )
 
         calls["write"].clear()

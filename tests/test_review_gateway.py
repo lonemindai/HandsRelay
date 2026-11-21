@@ -308,7 +308,8 @@ def test_receipts_bound_what_they_keep(gw, client, monkeypatch):
 def test_undecodable_frame_never_becomes_an_html_500(gw, client, monkeypatch):
     monkeypatch.setattr(gw, "_fetch_screenshot", lambda **kw: (b"not a png", "image/png", None))
     r = client.get("/v1/screen", headers=TOKEN)
-    assert r.status_code == 200 and r.data == b"not a png" and "ETag" not in r.headers
+    # R13 freshness: an undecodable capture is a JSON 502, still never an HTML 500.
+    assert r.status_code == 502 and r.get_json()["ok"] is False and "ETag" not in r.headers
     r = client.get("/v1/screen/hash", headers=TOKEN)
     assert r.status_code == 502 and r.get_json()["ok"] is False
     assert client.get("/v1/screen/wait?since=x&timeout=0", headers=TOKEN).status_code == 502

@@ -291,9 +291,12 @@ def run():
         hands._clipboard_backend = lambda: None
         r = client.post("/type", json={"text": "hello", "method": "keys",
                                        "jitter": False}, headers=AUTH)
-        check("type jitter=false -> one write(text, interval=0.02)",
+        # R13 B10: one guarded key loop for every mode -- jitter=false is
+        # one write per character (fixed 0.02 s pause), owner-checked
+        # before each unit, instead of one unguarded write(text).
+        check("type jitter=false -> one guarded write per char",
               r.status_code == 200
-              and calls == [("write", ("hello",), {"interval": 0.02})])
+              and calls == [("write", (c,), {}) for c in "hello"])
 
         # (a) Only our own keystrokes move dwTime: all 40 chars land.
         clock = _InputClock()
@@ -310,9 +313,9 @@ def run():
               and body["method_used"] == "keys" and body["chars"] == 40
               and written == url40)
 
-        # (b) Owner input during the pause after char 18: the type
-        # aborts at the next 12-char boundary (24) with the honest
-        # partial, and nothing past the boundary is typed.
+        # (b) Owner input during the pause after char 18: R13 B10 stops
+        # before the next unit (char 19) with the honest partial; nothing
+        # past char 18 is typed (pre-R13 this was the 12-char boundary, 24).
         clock = _InputClock(owner_on_sleep=18)
         fake_pag.write = clock.write
         hands.time.sleep = clock.sleep
@@ -322,11 +325,11 @@ def run():
                         headers=AUTH)
         body = r.get_json()
         written = "".join(c[1][0] for c in calls if c[0] == "write")
-        check("type owner input mid-type -> 409 type_aborted at char 24",
+        check("type owner input mid-type -> 409 type_aborted at char 18",
               r.status_code == 409 and body["ok"] is False
               and body["error_code"] == "type_aborted"
-              and body["aborted"] is True and body["chars_typed"] == 24
-              and body["chars"] == 40 and written == url40[:24])
+              and body["aborted"] is True and body["chars_typed"] == 18
+              and body["chars"] == 40 and written == url40[:18])
     finally:
         fake_pag.write = orig_write
         hands.time.sleep = orig_sleep_stub

@@ -328,7 +328,8 @@ def test_off_is_byte_for_byte_the_old_gateway(monkeypatch, tmp_path):
 
     new = run(_gateway(monkeypatch))
     old = run(_gateway(monkeypatch, old_path))
-    assert new == old
+    from r13_contract import compare
+    compare([p for _, p, _ in script], new, old)
     old_rules = {r.rule for r in _gateway(monkeypatch, old_path).app.url_map.iter_rules()}
     new_rules = {r.rule for r in _gateway(monkeypatch).app.url_map.iter_rules()}
     # claim-yield (2026-11-16) adds the read-only claim status route.

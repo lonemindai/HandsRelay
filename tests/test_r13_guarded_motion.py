@@ -42,7 +42,7 @@ def test_owner_before_first_move_yields(hands, monkeypatch):
     monkeypatch.setattr(hands.pyautogui, "moveTo", lambda *a, **k: moves.append(a))
     response = post(hands, "move", {"x": 5, "y": 6, "human": False})
     assert response.status_code == 409
-    assert response.get_json()["error_code"] == "yield"
+    assert response.get_json()["error_code"] == "owner_active"  # v4 yield-reason name
     assert moves == []
 
 def test_same_tick_during_scroll_chunk_stops_the_next_chunk(hands, monkeypatch):
@@ -125,7 +125,7 @@ def test_focus_does_not_activate_after_owner_event(hands, monkeypatch):
     monkeypatch.setattr(hands, "_activate_window", lambda win: activated.append(win) or True)
     response = post(hands, "focus", {"title": "Kept"})
     assert response.status_code == 409
-    assert response.get_json()["error_code"] == "yield"
+    assert response.get_json()["error_code"] == "owner_active"  # v4 yield-reason name
     assert activated == []
 
 def test_resting_lock_stops_the_next_substep(hands, monkeypatch):

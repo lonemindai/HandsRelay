@@ -48,7 +48,8 @@ def test_never_pausing_client_unchanged(gw):
     live = gw._current_watchers(now=1010.0)
     assert [w["holder"] for w in live] == ["eyes"]
     assert live[0]["state"] == "watching"
-    assert set(live[0]) == {"holder", "since", "last_seen", "timeout_seconds", "state"}
+    assert {"holder", "since", "last_seen", "timeout_seconds", "state"} <= set(live[0])
+    assert live[0]["paused"] is False  # R13 observation fields ride alongside
     assert gw._current_watchers(now=1030.5) == []  # lapses exactly as before
 
 

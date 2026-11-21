@@ -38,7 +38,7 @@ def test_owner_before_first_unit_yields_without_a_write(hands, monkeypatch):
     monkeypatch.setattr(hands.pyautogui, "write", lambda *a, **k: written.append(a))
     response = post(hands, {"text": "abcdef", "method": "keys", "jitter": False})
     assert response.status_code == 409
-    assert response.get_json()["error_code"] == "yield"
+    assert response.get_json()["error_code"] == "owner_active"  # v4 yield-reason name
     assert written == []
     assert "chars_typed" not in response.get_json()
 
