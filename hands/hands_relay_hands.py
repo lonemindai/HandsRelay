@@ -98,7 +98,7 @@ import urllib.request
 import uuid
 
 import pyautogui
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, has_request_context
 
 PORT = 5000
 
@@ -141,6 +141,13 @@ motion = _load_motion()
 # OFF). uia.py imports nothing Windows-only at module level.
 uia = _load_sibling("uia.py", "hands_relay_hands_uia")
 UIA_TREE_ENABLED = os.environ.get("HANDS_UIA_TREE", "").strip() == "1"
+
+
+def _load_claim_sync():
+    return _load_sibling("claim_sync.py", "hands_relay_claim_sync")
+
+
+claim_sync = _load_claim_sync()
 
 # ---------------------------------------------------------------- server
 
@@ -224,6 +231,7 @@ LOCKOUT_SECONDS = 300  # ...5 minutes (restart the app to clear early)
 _BASE_DIR = os.path.dirname(
     os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
 )
+_claim_sync = claim_sync.ClaimSync(os.environ.get("HANDS_SYNC_DIR") or os.path.join(_BASE_DIR, "claim-sync"))
 _CONFIG_PATH = os.path.join(_BASE_DIR, "hands_relay_config.json")
 _LOG_FILE = os.path.join(_BASE_DIR, "hands_relay.log")
 
@@ -330,9 +338,20 @@ def _yield_if_active():
     except (TypeError, ValueError):
         threshold = 5.0
     locked, idle_seconds = _probe_lock_state()
-    # R9 (#28): input inside a recorded resting-hand span is ours, not the
-    # owner's — owner idle keeps counting from the owner's last input.
-    idle_seconds = _LEDGER.owner_idle(idle_seconds, _tick_ms())
+    # Hooks win over a timestamp span: a physical event during our own
+    # injection is still the owner's. A quiet hook plus a span that
+    # explains the idle tick is not owner activity. Idle with no such
+    # span remains the signal used when hooks have not observed it.
+    now_tick = _tick_ms()
+    if _owner_hook_recent(threshold):
+        idle_seconds = 0.0
+    else:
+        last = _LEDGER.last_input_tick(idle_seconds, now_tick)
+        if (owner_coverage() == "hook" and last is not None
+                and _LEDGER._is_self(last)):
+            idle_seconds = max(float(idle_seconds or 0.0), threshold)
+        else:
+            idle_seconds = _LEDGER.owner_idle(idle_seconds, now_tick)
     if locked is True:
         return (
             jsonify(
@@ -446,6 +465,15 @@ def _focus_matches(expect, win):
         return False
     if want_process and str(want_process).lower() not in (win.get("process") or "").lower():
         return False
+    want_instance = expect.get("process_instance")
+    if isinstance(want_instance, str) and want_instance:
+        pid = win.get("pid")
+        try:
+            snap = _process_snapshot(pid) if type(pid) is int and pid > 0 else None
+        except Exception:
+            return False
+        if not isinstance(snap, dict) or snap.get("running") is not True or snap.get("instance") != want_instance:
+            return False
     return True
 
 
@@ -568,6 +596,97 @@ def health():
     return {"ok": True}
 
 
+# R13 B04: receiver-local, boot-bound, single-start execution leases.
+_EXECUTION_VERSION = 1
+_EXECUTION_BOOT = uuid.uuid4().hex
+_execution_lock = threading.RLock()
+_execution_leases = {}
+_EXECUTION_MAX = 512
+
+
+def _operation_digest(op, payload):
+    if not isinstance(payload, dict) or not isinstance(op, str):
+        raise ValueError("invalid operation")
+    clean = {k: v for k, v in payload.items() if k != "_execution_lease"}
+    encoded = json.dumps([op, clean], sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=True, allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _execution_mint(op, payload, lifetime):
+    if (type(lifetime) not in (int, float) or not math.isfinite(lifetime)
+            or not 1 <= lifetime <= 120):
+        raise ValueError("invalid_lifetime")
+    path = "/clipboard/set" if op == "clipboard_set" else "/" + str(op)
+    if path not in _ACT_PATHS:
+        raise ValueError("invalid_operation")
+    digest = _operation_digest(op, payload)
+    now = time.monotonic()
+    with _execution_lock:
+        for token, row in list(_execution_leases.items()):
+            if row["expires"] <= now:
+                del _execution_leases[token]
+        if len(_execution_leases) >= _EXECUTION_MAX:
+            raise ValueError("lease_capacity")
+        token = secrets_mod.token_urlsafe(32)
+        _execution_leases[token] = {"digest": digest, "expires": now + lifetime,
+                                    "started": False}
+    return {"version": _EXECUTION_VERSION, "boot": _EXECUTION_BOOT, "token": token}
+
+
+def _execution_check(metadata, op, payload, *, start=False):
+    """Called under input access immediately before first effect (B07).
+
+    Receiver time alone decides expiry. No public digest, renewal, or replay.
+    Return a controlled refusal code, or None. Starting consumes atomically.
+    """
+    if (not isinstance(metadata, dict) or type(metadata.get("version")) is not int
+            or metadata.get("version") != _EXECUTION_VERSION):
+        return "lease_invalid"
+    if metadata.get("boot") != _EXECUTION_BOOT:
+        return "lease_wrong_boot"
+    token = metadata.get("token")
+    if not isinstance(token, str):
+        return "lease_invalid"
+    try:
+        digest = _operation_digest(op, payload)
+    except (ValueError, TypeError):
+        return "lease_invalid"
+    with _execution_lock:
+        row = _execution_leases.get(token)
+        if row is None:
+            return "lease_unknown"
+        if row["digest"] != digest:
+            return "lease_operation_changed"
+        if row["started"]:
+            return "lease_consumed"
+        if time.monotonic() >= row["expires"]:
+            return "deadline_expired"
+        if start:
+            row["started"] = True
+    return None
+
+
+@app.get("/execution/capabilities")
+def execution_capabilities():
+    return jsonify({"ok": True, "execution_lease_version": _EXECUTION_VERSION,
+                    "boot": _EXECUTION_BOOT, "max_hold_seconds": 120,
+                    "foreground_hwnd": (_foreground_window() or {}).get("_hwnd")})
+
+
+@app.post("/execution/lease")
+def execution_lease():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error_code": "lease_invalid"}), 400
+    try:
+        metadata = _execution_mint(body.get("op"), body.get("payload"),
+                                   body.get("hold_seconds"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error_code": "lease_invalid"}), 400
+    return jsonify({"ok": True, "lease": metadata})
+
+
 # ---- capture seams ---------------------------------------------------------
 # Kept as module-level functions so tests can stub the Windows layer and
 # exercise the endpoint logic anywhere.
@@ -638,17 +757,170 @@ def _monitor_rects():
     return [{"x": 0, "y": 0, "w": int(w), "h": int(h), "primary": True}]
 
 
-def _grab(rect):
-    """Capture rect ({"x","y","w","h"}) or, with None, the full frame.
+class _CaptureOutOfRange(Exception):
+    """A monitor index is not in this topology snapshot."""
 
-    pyautogui on Windows captures the virtual desktop, so a region with
-    a negative origin works through the same call.
+
+class _CaptureOutOfSurface(Exception):
+    """The requested rect is outside the virtual surface. Never pad it."""
+
+
+class _CaptureTopologyChanged(Exception):
+    """Enumeration changed while the bitmap was being taken."""
+
+
+class _CaptureExtentMismatch(Exception):
+    """The bitmap size does not equal the topology union. No rescale."""
+
+
+class _CaptureBackendUnavailable(Exception):
+    """Neither ImageGrab nor pyautogui could return an all-screens bitmap."""
+
+
+def _topology_snapshot():
+    """One normalized monitor list. Order is not a display identity."""
+    snapshot = []
+    for rect in _monitor_rects():
+        snapshot.append(
+            {
+                "x": int(rect["x"]),
+                "y": int(rect["y"]),
+                "w": int(rect["w"]),
+                "h": int(rect["h"]),
+                "primary": bool(rect.get("primary")),
+            }
+        )
+    return snapshot
+
+
+def _union(topology):
+    """Global origin and extent of the virtual surface for this snapshot."""
+    x0 = min(rect["x"] for rect in topology)
+    y0 = min(rect["y"] for rect in topology)
+    x1 = max(rect["x"] + rect["w"] for rect in topology)
+    y1 = max(rect["y"] + rect["h"] for rect in topology)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def _grab_all_screens():
+    """All-screens bitmap. Cropping is never left to the backend.
+
+    ImageGrab(all_screens=True) is the selected Windows surface. pyautogui's
+    allScreens flag is only the fallback when ImageGrab cannot run, and a
+    region tuple is never forwarded: global coordinates are not surface
+    coordinates when the virtual origin is not (0, 0).
+    """
+    try:
+        from PIL import ImageGrab
+
+        image = ImageGrab.grab(all_screens=True)
+        if image is not None:
+            return image
+    except Exception:
+        image = None
+    try:
+        return pyautogui.screenshot(allScreens=True)
+    except Exception as exc:
+        raise _CaptureBackendUnavailable("virtual surface capture failed") from exc
+
+
+def capture_virtual_surface(topology=None):
+    """Pixels plus the global origin and extent of those pixels.
+
+    Coordinate space is the virtual desktop. Pixel (0, 0) is global
+    (vx, vy), the minimum monitor origin in this same topology snapshot.
+    A requested global rect (x, y, w, h) is the surface crop
+    (x-vx, y-vy, w, h). DPI mode for a packaged hands process is
+    Per-Monitor-V2 so these pixels match input coordinates. This module
+    does not change process DPI awareness and does not rescale: a bitmap
+    whose size differs from the topology union is refused.
+    """
+    snapshot = list(topology) if topology is not None else _topology_snapshot()
+    image = _grab_all_screens()
+    _vx, _vy, width, height = _union(snapshot)
+    return {
+        "image": image,
+        "x": _vx,
+        "y": _vy,
+        "w": image.size[0],
+        "h": image.size[1],
+        "topology": snapshot,
+        "expected_w": width,
+        "expected_h": height,
+    }
+
+
+def _grab(rect):
+    """Capture rect ({"x","y","w","h"}) or, with None, the legacy frame.
+
+    None keeps pyautogui.screenshot() with no region, the historical
+    default extent. A rect is cropped from the virtual surface of one
+    topology snapshot. The snapshot is read again after the grab; a
+    change refuses the bitmap instead of pairing it with another layout.
     """
     if rect is None:
         return pyautogui.screenshot()
-    return pyautogui.screenshot(
-        region=(int(rect["x"]), int(rect["y"]), int(rect["w"]), int(rect["h"]))
-    )
+    before = _topology_snapshot()
+    if not before:
+        raise _CaptureOutOfSurface("no monitors")
+    surface = capture_virtual_surface(before)
+    if _topology_snapshot() != before:
+        raise _CaptureTopologyChanged("monitor topology changed during capture")
+    image = surface["image"]
+    if image.size != (surface["expected_w"], surface["expected_h"]):
+        raise _CaptureExtentMismatch(
+            "capture extent does not match the monitor topology: "
+            f"bitmap {image.size[0]}x{image.size[1]}, "
+            f"topology {surface['expected_w']}x{surface['expected_h']}"
+        )
+    vx, vy = surface["x"], surface["y"]
+    x, y = int(rect["x"]), int(rect["y"])
+    w, h = int(rect["w"]), int(rect["h"])
+    left, top = x - vx, y - vy
+    right, bottom = left + w, top + h
+    if w <= 0 or h <= 0 or left < 0 or top < 0 or right > image.size[0] or bottom > image.size[1]:
+        raise _CaptureOutOfSurface("region is outside the virtual surface")
+    return image.crop((left, top, right, bottom))
+
+
+def _capture_indexed_monitor(monitor_idx):
+    """Resolve a monitor index and grab it from the same topology snapshot."""
+    last = None
+    for _attempt in (1, 2):
+        topology = _topology_snapshot()
+        if monitor_idx < 0 or monitor_idx >= len(topology):
+            raise _CaptureOutOfRange(
+                f"monitor {monitor_idx} out of range: "
+                f"{len(topology)} monitor(s) available"
+            )
+        rect = dict(topology[monitor_idx])
+        try:
+            image = _grab(rect)
+        except _CaptureTopologyChanged as exc:
+            last = exc
+            continue
+        if _topology_snapshot() != topology:
+            last = _CaptureTopologyChanged("monitor topology changed during capture")
+            continue
+        return image, rect, topology
+    raise last or _CaptureTopologyChanged("monitor topology changed during capture")
+
+
+def _capture_region(region_rect):
+    """Grab one global rect, retrying once if the topology changes."""
+    last = None
+    for _attempt in (1, 2):
+        topology = _topology_snapshot()
+        try:
+            image = _grab(region_rect)
+        except _CaptureTopologyChanged as exc:
+            last = exc
+            continue
+        if _topology_snapshot() != topology:
+            last = _CaptureTopologyChanged("monitor topology changed during capture")
+            continue
+        return image, dict(region_rect), topology
+    raise last or _CaptureTopologyChanged("monitor topology changed during capture")
 
 
 def _parse_region(raw):
@@ -708,7 +980,19 @@ def screenshot():
                 400,
             )
         rect = region_rect
-    img = _grab(rect)
+    try:
+        if monitor_idx is not None:
+            img, rect, topology = _capture_indexed_monitor(monitor_idx)
+        elif region_rect is not None:
+            img, rect, topology = _capture_region(region_rect)
+        else:
+            img, rect, topology = _grab(None), None, None
+    except _CaptureOutOfRange as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except _CaptureOutOfSurface as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except (_CaptureTopologyChanged, _CaptureExtentMismatch, _CaptureBackendUnavailable) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
@@ -722,6 +1006,11 @@ def screenshot():
             f"{region_rect['x']},{region_rect['y']},"
             f"{region_rect['w']},{region_rect['h']}"
         )
+    if topology is not None and rect is not None:
+        vx, vy, sw, sh = _union(topology)
+        resp.headers["X-Screen-Origin"] = f"{vx},{vy}"
+        resp.headers["X-Screen-Surface"] = f"{sw},{sh}"
+        resp.headers["X-Screen-Rect"] = f"{rect['x']},{rect['y']},{rect['w']},{rect['h']}"
     return resp
 
 
@@ -780,22 +1069,109 @@ _INPUT = motion.InputMutex(clock=lambda: time.monotonic(), sleep=lambda s: time.
 _LEDGER = motion.SelfInputLedger()
 
 
+class _InputRefused(Exception):
+    def __init__(self, response):
+        self.response = response
+
+
+class _PasteUnavailable(Exception):
+    """Paste cannot start. A key fallback is still allowed."""
+
+
+class _PasteUncertain(Exception):
+    """The paste chord may have reached the desktop. Do not also type it."""
+
+
+class _PasteAborted(Exception):
+    """Clipboard work stopped before the chord. No key fallback."""
+
+    def __init__(self, body, status=409):
+        self.body = body
+        self.status = status
+
+
+@app.errorhandler(_InputRefused)
+def _input_refused(error):
+    return error.response
+
+
+_guard_local = threading.local()
+
+
 class _input:
-    """with _input("mouse"|"keys"): hold the input mutex for one op."""
+    """Serialize, then revalidate under input access; failed enter releases."""
 
     def __init__(self, kind):
         self.kind = kind
+        self.started = False
+
+    def check(self, start=False):
+        if not has_request_context():
+            return
+        if self.started:
+            refused = _focus_guard()
+            reason = "foreground_changed" if refused is not None else None
+            # Typing owns its partial-count lock checkpoints; B10 unifies
+            # those without losing the structured type-abort response.
+            if request.path != "/type" and _probe_locked() is True:
+                reason = "locked"
+            if reason:
+                raise _InputRefused((jsonify({"ok": False, "aborted": True,
+                    "error_code": "input_aborted", "abort_reason": reason}), 409))
+        else:
+            refused = _yield_if_active()
+            if refused is None:
+                refused = _focus_guard()
+            if refused is not None:
+                raise _InputRefused(refused)
+        body = request.get_json(silent=True) or {}
+        if not self.started and "_execution_lease" in body:
+            op = "clipboard_set" if request.path == "/clipboard/set" else request.path.lstrip("/")
+            code = _execution_check(body["_execution_lease"], op, body, start=start)
+            if code:
+                raise _InputRefused((jsonify({"ok": False, "error_code": code}), 409))
+
+    def before_effect(self):
+        self.check(start=not self.started)
+        if not self.started:
+            _resting.act_begin()
+            self.started = True
 
     def __enter__(self):
         _INPUT.acquire(self.kind, random)
-        _resting.act_begin()
-        return self
+        try:
+            self.check()
+            _guard_local.current = self
+            return self
+        except BaseException:
+            _INPUT.release(self.kind)
+            raise
 
     def __exit__(self, *exc):
-        # R11: every real agent act resets the resting-hand ramp to zero.
-        _resting.act_end(time.monotonic())
-        _INPUT.release(self.kind)
+        try:
+            if self.started:
+                _resting.act_end(time.monotonic())
+        finally:
+            _guard_local.current = None
+            _INPUT.release(self.kind)
         return False
+
+
+def _before_effect():
+    guard = getattr(_guard_local, "current", None)
+    if guard is not None:
+        guard.before_effect()
+
+
+def _inject(function, *args, **kwargs):
+    _before_effect()
+    started = _tick_ms()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        ended = _tick_ms()
+        if started is not None and ended is not None:
+            _LEDGER.record(started, ended)
 
 
 def _human(d):
@@ -814,17 +1190,62 @@ def _plan_path(x0, y0, x1, y1, rng, width=None, path_seconds=None):
     return motion.plan_move(x0, y0, x1, y1, rng, width=width, path_seconds=path_seconds)
 
 
-def _run_path(steps):
+def _peek_unit(guard):
+    """Owner, lock, then focus. None means the next unit may be emitted."""
+    guard.sample()
+    if guard.owner_seen:
+        return "owner", None
+    if _probe_locked() is True:
+        return "locked", None
+    if has_request_context():
+        focus = _focus_guard()
+        if focus is not None:
+            return "foreground_changed", focus
+    return None, None
+
+
+def _refuse_unit(kind, focus, started):
+    """A blocked first unit can yield. Anything later is a partial abort."""
+    if not started:
+        if focus is not None:
+            return focus
+        return _pre_effect_response("locked" if kind == "locked" else "owner")
+    return (jsonify({
+        "ok": False,
+        "aborted": True,
+        "error": "input aborted after a side effect",
+        "error_code": "input_aborted",
+        "abort_reason": kind,
+    }), 409)
+
+
+def _guarded_inject(guard, started, function, *args, **kwargs):
+    kind, focus = _peek_unit(guard)
+    if kind:
+        raise _InputRefused(_refuse_unit(kind, focus, started[0]))
+    result = _inject(function, *args, **kwargs)
+    guard.after_write()
+    started[0] = True
+    return result
+
+
+def _run_path(steps, guard=None, started=None):
+    guard = guard or _TypeOwnerGuard()
+    if started is None:
+        started = [False]
     for sx, sy, delay in steps:
-        pyautogui.moveTo(sx, sy, duration=0)
+        _guarded_inject(guard, started, pyautogui.moveTo, sx, sy, duration=0)
         time.sleep(delay)
+    return guard, started
 
 
-def _move_human(x, y, rng=None, width=None, path_seconds=None):
+def _move_human(x, y, rng=None, width=None, path_seconds=None, guard=None, started=None):
     """Move the cursor to (x, y) along a planned human-like path."""
     rng = rng if rng is not None else random
     x0, y0 = pyautogui.position()
-    _run_path(_plan_path(x0, y0, x, y, rng, width=width, path_seconds=path_seconds))
+    return _run_path(
+        _plan_path(x0, y0, x, y, rng, width=width, path_seconds=path_seconds),
+        guard=guard, started=started)
 
 
 def _box(d):
@@ -871,7 +1292,7 @@ def move():
                 time.sleep(motion.attention_delay(random, d.get("text_chars")))
             _move_human(x, y, width=min(w, h) if w else None)
         else:
-            pyautogui.moveTo(x, y, duration=0.2)
+            _guarded_inject(_TypeOwnerGuard(), [False], pyautogui.moveTo, x, y, duration=0.2)
     return {"ok": True}
 
 
@@ -898,8 +1319,23 @@ def _do_click(d):
         return _bad_request("button must be one of " + ", ".join(_CLICK_BUTTONS))
     if not _human(d):
         with _input("mouse"):
-            pyautogui.moveTo(x, y, duration=0.2)
-            pyautogui.click(x=x, y=y, button=button)
+            guard, started = _TypeOwnerGuard(), [False]
+            _guarded_inject(guard, started, pyautogui.moveTo, x, y, duration=0.2)
+            begun = {"v": False}
+
+            def _click(begun=begun):
+                begun["v"] = True
+                return pyautogui.click(x=x, y=y, button=button)
+
+            try:
+                _guarded_inject(guard, started, _click)
+            except Exception:
+                if begun["v"]:
+                    try:
+                        pyautogui.mouseUp(button=button)
+                    except Exception:
+                        pass
+                raise
         return {"ok": True}
     rng = random
     w, h = _box(d)
@@ -920,10 +1356,16 @@ def _do_click(d):
         )
         if attention:
             time.sleep(attention)
-        _move_human(tx, ty, rng, path_seconds=travel)
+        guard, started = _TypeOwnerGuard(), [False]
+        _move_human(tx, ty, rng, path_seconds=travel, guard=guard, started=started)
         time.sleep(hover)
-        pyautogui.mouseDown(x=tx, y=ty, button=button)
+        kind, focus = _peek_unit(guard)
+        if kind:
+            raise _InputRefused(_refuse_unit(kind, focus, started[0]))
+        _before_effect()
         try:
+            _inject(pyautogui.mouseDown, x=tx, y=ty, button=button)
+            guard.after_write()
             time.sleep(hold)
         finally:
             pyautogui.mouseUp(x=tx, y=ty, button=button)
@@ -943,44 +1385,64 @@ def _do_click(d):
 
 # "auto" typing pastes text longer than this (settings: paste_auto_min_chars).
 PASTE_AUTO_MIN_CHARS = 120
+def _release_chord(keys):
+    """Required key-up cleanup. Never treated as a new input unit."""
+    for key in keys:
+        try:
+            pyautogui.keyUp(key)
+        except Exception:
+            pass
+
+
+def _owner_attribution_limit():
+    """What this process cannot honestly attribute to the owner."""
+    coverage = owner_coverage()
+    if coverage == "degraded":
+        return "unreliable"
+    if coverage == "hook":
+        return "non-injected-events-only"
+    return "same-tick-and-grace-blind"
+
+
+def _pre_effect_response(kind):
+    if kind == "locked":
+        error, code = "desktop locked — control yielded", "locked"
+    else:
+        error, code = "user active — control yielded", "owner_active"
+    return jsonify({"ok": False, "error": error, "error_code": code}), 409
 
 
 def _type_dispatch(method, keys_fn, paste_fn, text):
-    """Pick the type path; returns (method_used, note)."""
+    """Pick the type path. Keys fallback only if paste never started."""
     if method == "keys":
         return keys_fn(), None
-    if method == "paste":
+    wants_paste = method == "paste" or (
+        method == "auto" and len(text) > PASTE_AUTO_MIN_CHARS and _clipboard_backend() is not None
+    )
+    if wants_paste:
         try:
             return paste_fn(), None
-        except Exception as exc:
-            return keys_fn(), f"paste requested but unavailable ({exc}); used keys"
-    if len(text) > PASTE_AUTO_MIN_CHARS and _clipboard_backend() is not None:
-        try:
-            return paste_fn(), None
-        except Exception as exc:
-            return keys_fn(), f"paste failed ({exc}); used keys"
+        except _PasteUnavailable as exc:
+            return keys_fn(), f"paste unavailable ({exc}); used keys"
     return keys_fn(), None
 
 
 @app.post("/type")
 def type_text():
-    """Type text: clipboard paste for long payloads, jittered keys else.
+    """Type text one character at a time, or paste when that path is safe.
 
     {text, method?: "auto"|"paste"|"keys", jitter?: bool}
 
-    Method (wishlist #9): "auto" pastes when the text is over 120 chars
-    and a clipboard backend exists — the paste path saves the current
-    clipboard and restores it afterwards; "paste" forces that path;
-    "keys" forces keystrokes. Any clipboard failure falls back to
-    keystrokes instead of failing the request (see "note").
+    Jitter changes delays only. Both key modes use the same per-character
+    loop: sample owner, lock, and focus before each character; an owner
+    event during the current character stops the next one. A fixed 0.02 s
+    delay is the non-jitter plan.
 
-    Jitter (wishlist #16): the keystroke path types per character with
-    human-band delays from _plan_key_delays unless jitter is false —
-    false restores the original single pyautogui.write(interval=0.02).
-
-    Response: {"ok", "method_used", "chars", "elapsed_seconds",
-    "delays_planned", "planned_seconds"} — the delay fields describe the
-    keystroke plan (0 on the paste path).
+    Paste samples before clipboard mutation and again before Ctrl+V.
+    Owner activity before the chord does not paste. The saved clipboard
+    is restored only when it still holds the value this call placed.
+    A chord that may have been sent never falls back to typing, and the
+    response does not invent chars_typed for paste consumption.
     """
     refused = _yield_if_active()
     if refused is not None:
@@ -993,144 +1455,191 @@ def type_text():
     if method not in ("auto", "paste", "keys"):
         return jsonify({"ok": False, "error": "method must be auto, paste or keys"}), 400
     jitter = bool(d.get("jitter", True))
-    _owner_monitor.ensure_started()  # no-op off Windows / once running
+    _owner_monitor.ensure_started()
     started = time.monotonic()
     note = None
     delays = []
-
     typed = 0
-    state = {"guard": None, "reason": None}
+    state = {"guard": None, "reason": None, "pre_effect": None}
+
+    def _unit_block(guard):
+        """(kind, focus_response) when the next unit must not be emitted."""
+        guard.sample()
+        if guard.owner_seen:
+            return "owner", None
+        if _probe_locked() is True:
+            return "locked", None
+        focus = _focus_guard()
+        if focus is not None:
+            return "foreground_changed", focus
+        return None, None
+
+    def _remember_block(kind, focus):
+        if typed == 0:
+            state["pre_effect"] = focus if focus is not None else _pre_effect_response(
+                "locked" if kind == "locked" else "owner")
+        else:
+            state["reason"] = kind
 
     def _keys():
         nonlocal delays, typed
-        if jitter:
-            delays = _plan_key_delays(text, random)
-            # R4 (F7) re-checked the yield every 12 chars so a long
-            # type gated only at the door cannot interleave relay
-            # keystrokes with the owner's for the op's whole duration.
-            # R7.2 (wishlist #27): that re-check consulted
-            # _yield_if_active(), whose idle probe counts this type's
-            # OWN injected keystrokes as session input — after 12 of
-            # our own chars the idle read ~0 and the type aborted on
-            # itself, owner or no owner. Track dwTime instead: sample
-            # it after each keystroke (that stamp is ours by
-            # construction) and flag owner input when a later sample
-            # is strictly newer than the stamp our last keystroke
-            # explains. The abort still lands on the same 12-char
-            # boundaries and reports the same partial, so the response
-            # contract is unchanged. Accepted blind spot: an owner
-            # event inside the same tick as one of our keystrokes is
-            # indistinguishable from that keystroke. Off Windows / on
-            # probe failure dwTime is None and the re-check is inert,
-            # like the door's.
-            guard = _TypeOwnerGuard()
-            state["guard"] = guard.mode
-            for ch, delay in zip(text, delays):
-                # R7.2 fix (Finding 3): sample FIRST, so owner input
-                # during the sleep after char 12 stops char 13.
-                guard.sample()
-                if typed and typed % 12 == 0:
-                    if guard.owner_seen:
-                        state["reason"] = "owner"
-                        break
-                    # Finding 2: a lock with no new input moves no
-                    # timestamp — check the lock itself, lock-only.
-                    if _probe_locked() is True:
-                        state["reason"] = "locked"
-                        break
-                pyautogui.write(ch)
-                guard.after_write()
-                time.sleep(delay)
-                typed += 1
-            state["guard"] = guard.mode
-        else:
-            pyautogui.write(text, interval=0.02)
-            typed = len(text)
+        delays = _plan_key_delays(text, random) if jitter else [0.02] * len(text)
+        guard = _TypeOwnerGuard()
+        state["guard"] = guard.mode
+        for ch, delay in zip(text, delays):
+            kind, focus = _unit_block(guard)
+            if kind:
+                _remember_block(kind, focus)
+                break
+            try:
+                _inject(pyautogui.write, ch)
+            except _InputRefused as exc:
+                if typed == 0:
+                    state["pre_effect"] = exc.response
+                else:
+                    body = exc.response[0].get_json() if isinstance(exc.response, tuple) else exc.response.get_json()
+                    state["reason"] = (body or {}).get("error_code") or "aborted"
+                break
+            except Exception:
+                _release_chord(("shift", "ctrl", "alt"))
+                raise
+            guard.after_write()
+            time.sleep(delay)
+            typed += 1
+        state["guard"] = guard.mode
         return "keys"
 
     def _paste():
         nonlocal typed
         backend = _clipboard_backend()
         if backend is None:
-            raise RuntimeError("clipboard unavailable on this host")
-        guard = _TypeOwnerGuard()
-        state["guard"] = guard.mode
-        target_hwnd = _foreground_hwnd()
+            raise _PasteUnavailable("clipboard unavailable on this host")
         saved, readable = None, False
         try:
             saved = backend.get_text()
             readable = True
         except Exception:
-            pass  # unreadable clipboard: paste anyway, skip the restore
+            pass
+        guard = _TypeOwnerGuard()
+        state["guard"] = guard.mode
+        kind, focus = _unit_block(guard)
+        if kind:
+            raise _InputRefused(focus if focus is not None else _pre_effect_response(
+                "locked" if kind == "locked" else "owner"))
+        _before_effect()
+        mutated = False
+        placed = None
+        chord_attempted = False
         try:
-            backend.set_text(text)
-            # The paste path has its own provenance checks; it must not
-            # inherit the keystroke guard's coverage by implication.
-            if guard.sample():
-                state["reason"] = "owner"
-                return "paste"
-            if _probe_locked() is True:
-                state["reason"] = "locked"
-                return "paste"
-            if target_hwnd is not None and _foreground_hwnd() != target_hwnd:
-                state["reason"] = "foreground"
-                return "paste"
-            pyautogui.hotkey("ctrl", "v")
-            typed = len(text)  # paste is atomic from the relay's perspective
-            guard.after_write()
+            try:
+                backend.set_text(text)
+            except _InputRefused:
+                raise
+            except Exception as exc:
+                if getattr(backend, "changed", False):
+                    mutated = True
+                    placed = text
+                    raise _PasteUncertain(f"clipboard mutation outcome unknown ({exc})")
+                raise _PasteUnavailable(str(exc))
+            mutated = True
+            placed = text
+            kind, _focus = _unit_block(guard)
+            if kind:
+                raise _PasteAborted({
+                    "ok": False,
+                    "error": f"paste stopped before the chord ({kind})",
+                    "error_code": "paste_aborted",
+                    "abort_reason": kind,
+                    "injected": False,
+                    "method_used": "paste",
+                })
+
+            def _chord():
+                nonlocal chord_attempted
+                chord_attempted = True
+                return pyautogui.hotkey("ctrl", "v")
+
+            try:
+                _inject(_chord)
+            except _InputRefused as exc:
+                if chord_attempted:
+                    raise _PasteUncertain("paste chord may have been sent during refusal") from exc
+                body = exc.response[0].get_json() if isinstance(exc.response, tuple) else exc.response.get_json()
+                raise _PasteAborted({
+                    "ok": False,
+                    "error": "paste stopped before the chord",
+                    "error_code": "paste_aborted",
+                    "abort_reason": (body or {}).get("error_code") or "aborted",
+                    "injected": False,
+                    "method_used": "paste",
+                })
             if readable:
-                # Let the target consume the paste before restoring the
-                # previous clipboard contents.
                 time.sleep(0.1)
-            # After injection only an owner takeover is reported. A lock
-            # after the atomic paste does not undo the delivered text, and
-            # reporting it as an abort would invite a duplicate retry.
-            if guard.sample():
-                state["reason"] = "owner"
+        except (_PasteUncertain, _PasteAborted, _PasteUnavailable, _InputRefused):
+            raise
+        except Exception as exc:
+            if chord_attempted or mutated:
+                raise _PasteUncertain(f"paste chord may have been sent ({exc})")
+            raise _PasteUnavailable(str(exc))
         finally:
-            if readable and saved is not None:
+            if chord_attempted:
+                _release_chord(("ctrl", "v"))
+            if mutated and readable and saved is not None:
                 try:
-                    backend.set_text(saved)
+                    current = backend.get_text()
                 except Exception:
-                    pass
+                    current = None
+                if current == placed:
+                    try:
+                        backend.set_text(saved)
+                    except Exception:
+                        pass
         return "paste"
 
-    with _input("keys"):
-        method_used, note = _type_dispatch(method, _keys, _paste, text)
+    try:
+        with _input("keys"):
+            method_used, note = _type_dispatch(method, _keys, _paste, text)
+    except _PasteUncertain as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "error_code": "paste_uncertain",
+            "method_used": "paste",
+            "injected": "uncertain",
+            "chars": len(text),
+        }), 502
+    except _PasteAborted as exc:
+        return jsonify(exc.body), exc.status
 
-    if state["reason"] is not None or (method_used == "keys" and typed < len(text)):
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    # Deliberately NOT yield-classified (error_code is
-                    # not "yield"/"locked", and the prose avoids the
-                    # legacy substrings): some chars already landed, so
-                    # a queued retry of the whole payload would
-                    # double-type the prefix. The receipt settles
-                    # failed with chars_typed; the caller re-submits
-                    # text[chars_typed:].
-                    "error": (
-                        f"desktop locked — typing aborted at char {typed}"
-                        if state["reason"] == "locked"
-                        else (f"foreground changed — typing aborted at char {typed}"
-                              if state["reason"] == "foreground"
-                              else f"owner became active — typing aborted at char {typed}")
-                    ),
-                    "error_code": "type_aborted",
-                    "abort_reason": state["reason"],
-                    "owner_guard": state["guard"],
-                    "aborted": True,
-                    "chars_typed": typed,
-                    "chars": len(text),
-                    "method_used": method_used,
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                    "delays_planned": len(delays),
-                    "planned_seconds": sum(delays[:typed]),
-                }
-            ),
-            409,
-        )
+    if state["pre_effect"] is not None and typed == 0:
+        return state["pre_effect"]
+    if method_used == "keys" and typed < len(text):
+        reason = state["reason"] or "owner"
+        if reason == "locked":
+            error = f"desktop locked — typing aborted at char {typed}"
+        elif reason == "foreground_changed":
+            error = f"foreground changed — typing aborted at char {typed}"
+        else:
+            error = f"owner became active — typing aborted at char {typed}"
+        body = {
+            "ok": False,
+            "error": error,
+            "error_code": "type_aborted",
+            "abort_reason": reason,
+            "owner_guard": state["guard"],
+            "aborted": True,
+            "chars_typed": typed,
+            "chars": len(text),
+            "method_used": "keys",
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "delays_planned": len(delays),
+            "planned_seconds": sum(delays[:typed]),
+        }
+        limit = {"hook": "non-injected-events-only",
+                 "dwtime": "same-tick-and-grace-blind"}.get(state["guard"])
+        if limit:
+            body["owner_attribution_limit"] = limit
+        return jsonify(body), 409
     resp = {
         "ok": True,
         "method_used": method_used,
@@ -1140,9 +1649,15 @@ def type_text():
         "delays_planned": len(delays),
         "planned_seconds": sum(delays),
     }
+    if state["guard"] == "hook":
+        resp["owner_attribution_limit"] = "non-injected-events-only"
+    elif state["guard"] == "dwtime":
+        resp["owner_attribution_limit"] = "same-tick-and-grace-blind"
     if note:
         resp["note"] = note
     return jsonify(resp)
+
+
 @app.post("/key")
 def key():
     d = _json_body()
@@ -1150,7 +1665,19 @@ def key():
     if not isinstance(name, str) or not name.strip():
         return _bad_request("key must be a non-empty string")
     with _input("keys"):
-        pyautogui.press(name)
+        name = d["key"]
+        begun = {"v": False}
+
+        def _press(begun=begun, name=name):
+            begun["v"] = True
+            return pyautogui.press(name)
+
+        try:
+            _guarded_inject(_TypeOwnerGuard(), [False], _press)
+        except Exception:
+            if begun["v"]:
+                _release_chord((name,))
+            raise
     return {"ok": True}
 
 
@@ -1164,13 +1691,14 @@ def scroll():
     except (TypeError, ValueError, OverflowError):
         return _bad_request("clicks must be an integer")
     with _input("mouse"):
+        guard, started = _TypeOwnerGuard(), [False]
         if _human(d):
             for chunk, pause in motion.plan_scroll(clicks, random):
-                pyautogui.scroll(chunk)
+                _guarded_inject(guard, started, pyautogui.scroll, chunk)
                 if pause:
                     time.sleep(pause)
         else:
-            pyautogui.scroll(clicks)
+            _guarded_inject(guard, started, pyautogui.scroll, clicks)
     return {"ok": True}
 
 
@@ -1440,6 +1968,50 @@ _owner_monitor = _OwnerInputMonitor()
 def _owner_input_snapshot():
     """(owner_events, injected_events) from the hooks, or None. Seam."""
     return _owner_monitor.snapshot()
+
+
+# Persistent across actions. A fresh per-action snapshot would forget
+# physical input that happened before the action started.
+_owner_observed = {"count": None, "at": None}
+_owner_degraded = {"reason": None}
+
+
+def _observe_owner_counter():
+    snap = _owner_input_snapshot()
+    if not isinstance(snap, tuple) or not snap:
+        return None
+    try:
+        owner = int(snap[0])
+    except (TypeError, ValueError):
+        return None
+    if _owner_observed["count"] is not None and owner != _owner_observed["count"]:
+        _owner_observed["at"] = time.monotonic()
+    _owner_observed["count"] = owner
+    return owner
+
+
+def _owner_hook_recent(threshold):
+    """True when a physical hook event is still inside the yield window."""
+    _observe_owner_counter()
+    at = _owner_observed["at"]
+    try:
+        window = float(threshold)
+    except (TypeError, ValueError):
+        return False
+    return at is not None and (time.monotonic() - at) < window
+
+
+def owner_coverage():
+    """hook, unavailable, or degraded. Degraded is never reported as reliable."""
+    if _owner_degraded["reason"]:
+        return "degraded"
+    if isinstance(_owner_input_snapshot(), tuple):
+        return "hook"
+    return "unavailable"
+
+
+def mark_owner_coverage_degraded(reason):
+    _owner_degraded["reason"] = str(reason or "degraded")
 
 
 # Our own keystroke may publish its dwTime AFTER the post-write probe
@@ -1747,6 +2319,10 @@ def _display_state(idle_seconds):
 # the episode baseline outside our own ledger spans, or the pointer not
 # where we left it) and the hand stays still until the next agent act.
 # Never moves while locked, while the probe is blind, or during an act.
+# R12 (#36): each float step is executed as an interpolated glide
+# (motion.plan_rest_path) instead of one instant moveTo — the pointer
+# travels the 1-3 px along an eased micro-path; the contract above is
+# unchanged, including the mid-glide owner-grab abort in _move.
 
 class _RestingHand:
     POLL = 0.1
@@ -1837,6 +2413,10 @@ class _RestingHand:
                 return 0.5
             if self.acting or self.owner_stopped:
                 return self.POLL
+        if owner_coverage() == "degraded":
+            with self._lock:
+                self._end()
+            return 1.0
         locked, raw_idle = _probe_lock_state()
         now_tick = _tick_ms()
         with self._lock:
@@ -1878,14 +2458,55 @@ class _RestingHand:
         return self.POLL
 
     def _move(self, target):
-        """Inject one float step; None if the owner moved the pointer."""
+        """Glide one float step (R12 #36); None if the owner took over.
+
+        R11 executed the step as a single moveTo(duration=0) and the
+        pointer teleported 1-3 px. Now the travel follows
+        motion.plan_rest_path: interpolated sub-steps (<= 1 px apart)
+        along the human-like planner's curve, spread over the glide
+        duration. Before every sub-step the pointer must still be where
+        the glide left it; if it is not, the owner's hand is on the
+        mouse and the glide aborts at once — step() ends the episode
+        exactly as it did for a fought instant move.
+        """
         t0 = _tick_ms()
         # Record BEFORE injecting: a concurrent yield probe must already
-        # see this span as ours.
-        _LEDGER.record(t0, (t0 + 250) & 0xFFFFFFFF)
-        pyautogui.moveTo(target[0], target[1], duration=0.12)
+        # see this span as ours. The provisional end covers the longest
+        # glide (REST_GLIDE_MAX_S); truncate_last closes the span at its
+        # true end, and the finally below guarantees that close even if
+        # a sub-step raises — otherwise a fault mid-glide would leave
+        # the full 1500 ms provisional standing, a window in which real
+        # owner input could be misread as self-input (review F3).
+        _LEDGER.record(t0, (t0 + 1500) & 0xFFFFFFFF)
+        fought = False
+        expect = None
+        try:
+            start = tuple(pyautogui.position())
+            steps = motion.plan_rest_path(start[0], start[1], target[0], target[1], self.rng)
+            expect = start
+            initial = _owner_input_snapshot()
+            initial_owner = initial[0] if isinstance(initial, tuple) else None
+            for sx, sy, delay in steps:
+                px, py = pyautogui.position()
+                current = _owner_input_snapshot()
+                owner_changed = (initial_owner is not None and isinstance(current, tuple)
+                                 and current[0] != initial_owner)
+                permit_lost = self.claim_until is not None and not self.claim_held(self._clock())
+                if (permit_lost
+                        or owner_changed or _probe_locked() is True
+                        or owner_coverage() == "degraded"
+                        or abs(px - expect[0]) > 1 or abs(py - expect[1]) > 1):
+                    fought = True
+                    break
+                _inject(pyautogui.moveTo, sx, sy, duration=0)
+                expect = (sx, sy)
+                if delay > 0:
+                    time.sleep(delay)
+        finally:
+            _LEDGER.truncate_last((_tick_ms() + 50) & 0xFFFFFFFF)
+        if fought:
+            return None
         px, py = pyautogui.position()
-        _LEDGER.truncate_last((_tick_ms() + 50) & 0xFFFFFFFF)
         if abs(px - target[0]) > 1 or abs(py - target[1]) > 1:
             return None
         return (px, py)
@@ -1940,10 +2561,48 @@ def resting_get():
     return {"ok": True, **_resting.status()}
 
 
+@app.get("/resting/challenge")
+def resting_challenge():
+    """Single-use permit challenge, timed on this receiver's monotonic clock."""
+    return jsonify(_claim_sync.issue(time.monotonic()))
+
+
+def _restart_hands_boot():
+    """Test and lifecycle seam: a new boot drops every grant."""
+    _claim_sync.rotate_boot()
+    with _resting._lock:
+        _resting.claim_until = None
+        _resting.claim_seq = -1
+        _resting._end()
+
+
 @app.post("/resting/claim")
 def resting_claim():
-    """Gateway push: {held: bool, expires_in: seconds, seq: int}."""
+    """Gateway push.
+
+    Legacy: {held, expires_in, seq}. Authoritative: those fields plus
+    pairing, epoch, boot, and a single-use challenge. The legacy body
+    remains because existing direct callers assert it still applies.
+    """
     d = _json_body()
+    if any(key in d for key in ("epoch", "pairing", "boot", "challenge")):
+        result = _claim_sync.evaluate(d, time.monotonic(), _resting)
+        if result.get("invalid"):
+            return jsonify({"ok": False, "error": "claim sync message is invalid"}), 400
+        if result.get("applied") and d.get("held") is True:
+            start_resting_hand()
+        body = {
+            "ok": True,
+            "applied": bool(result.get("applied")),
+            "boot": d.get("boot"),
+            "epoch": d.get("epoch"),
+            "seq": d.get("seq"),
+            "claim_id": d.get("claim_id"),
+            **_resting.status(),
+        }
+        if _claim_sync.sync_error:
+            body["sync_error"] = _claim_sync.sync_error
+        return body
     held, seq = d.get("held"), d.get("seq")
     expires_in = d.get("expires_in", 0)
     if (
@@ -1977,6 +2636,14 @@ def state():
         locked, idle_seconds = None, None
     body = {"ok": True, "platform": platform, "locked": locked, "idle_seconds": idle_seconds}
     body["owner_idle_seconds"] = _LEDGER.owner_idle(idle_seconds, _tick_ms())
+    body["owner_coverage"] = owner_coverage()
+    body["owner_attribution_limit"] = _owner_attribution_limit()
+    body["claim_sync"] = {
+        "boot": _claim_sync.boot,
+        "epoch": _claim_sync.accepted_epoch,
+        "ok": _claim_sync.sync_error is None,
+        "error": _claim_sync.sync_error,
+    }
     body["resting_hand"] = _resting.status()
     body["human_motion"] = _human_motion_default()
     # Display sleep follows the OS idle clock, which injected input
@@ -2233,7 +2900,19 @@ def hotkey():
     ):
         return jsonify({"ok": False, "error": "keys must be a non-empty list of strings"}), 400
     with _input("keys"):
-        pyautogui.hotkey(*keys)
+        begun = {"v": False}
+
+        def _chord(begun=begun):
+            begun["v"] = True
+            return pyautogui.hotkey(*keys)
+
+        try:
+            _guarded_inject(_TypeOwnerGuard(), [False], _chord)
+        except Exception:
+            if begun["v"]:
+                _release_chord(keys)
+            raise
+        _release_chord(keys)
     return {"ok": True}
 
 
@@ -2241,12 +2920,12 @@ def hotkey():
 def break_():
     """Send Ctrl+C as a true chord, 1..3 times (default 1), 0.15s apart.
 
-    Root cause this fixes: the /key op calls pyautogui.press() with ONE
+    Root cause this fixes: the /key op calls _inject(pyautogui.press, ) with ONE
     key name, so sending the string "ctrl+c" to /key was never a real
     chord — press() treats it as a single (nonexistent) key name and
     nothing was interrupted. A long-running / polling foreground process
     therefore could not be stopped through the relay. /break (and
-    /hotkey) use pyautogui.hotkey(), which presses the keys together,
+    /hotkey) use _inject(pyautogui.hotkey, ), which presses the keys together,
     so the interrupt actually lands.
     """
     refused = _yield_if_active()
@@ -2257,8 +2936,21 @@ def break_():
     if isinstance(times, bool) or not isinstance(times, int) or not 1 <= times <= 3:
         return jsonify({"ok": False, "error": "times must be an integer 1..3"}), 400
     with _input("keys"):
+        guard, started = _TypeOwnerGuard(), [False]
         for i in range(times):
-            pyautogui.hotkey("ctrl", "c")
+            begun = {"v": False}
+
+            def _chord(begun=begun):
+                begun["v"] = True
+                return pyautogui.hotkey("ctrl", "c")
+
+            try:
+                _guarded_inject(guard, started, _chord)
+            except Exception:
+                if begun["v"]:
+                    _release_chord(("ctrl", "c"))
+                raise
+            _release_chord(("ctrl", "c"))
             if i < times - 1:
                 time.sleep(0.15)
     return {"ok": True, "times": times}
@@ -2286,25 +2978,32 @@ def drag():
         return jsonify({"ok": False, "error": "duration must be a number"}), 400
     human = _human(d)
     with _input("mouse"):
+        guard, started = _TypeOwnerGuard(), [False]
         if human:
             # R9 (#24): human approach to the grab point, a hover, then a
             # human path while held; duration (if given) is the held
             # travel time, else Fitts decides. Endpoints are exact.
-            _move_human(x1, y1)
+            _move_human(x1, y1, guard=guard, started=started)
             time.sleep(motion.hover_delay(random))
         else:
-            pyautogui.moveTo(x1, y1)
+            _guarded_inject(guard, started, pyautogui.moveTo, x1, y1)
         down = False
         try:
+            kind, focus = _peek_unit(guard)
+            if kind:
+                raise _InputRefused(_refuse_unit(kind, focus, started[0]))
             # Mark first so a mouseDown/move failure still releases the button.
             # duration 0 is real; do not coerce it with `or 0.4`.
             down = True
-            pyautogui.mouseDown(button=button)
+            _inject(pyautogui.mouseDown, button=button)
+            guard.after_write()
             if human:
                 time.sleep(motion.click_hold(random))
-                _move_human(x2, y2, path_seconds=duration)
+                _move_human(x2, y2, path_seconds=duration, guard=guard, started=started)
             else:
-                pyautogui.moveTo(x2, y2, duration=0.4 if duration is None else duration)
+                _guarded_inject(
+                    guard, started, pyautogui.moveTo, x2, y2,
+                    duration=0.4 if duration is None else duration)
         finally:
             if down:
                 pyautogui.mouseUp(button=button)
@@ -2540,23 +3239,30 @@ def focus():
     refused = _yield_if_active()
     if refused is not None:
         return refused
-    for win in _enum_windows():
-        candidate = (win.get("title") or "").casefold()
-        matched = candidate == needle if exact else needle in candidate
-        if matched:
-            if not _activate_window(win):
-                return (
-                    jsonify(
-                        {
-                            "ok": False,
-                            "error": "activation failed",
-                            "window": _shape_window(win),
-                        }
-                    ),
-                    409,
-                )
-            return jsonify({"ok": True, "window": _shape_window(win)})
-    return jsonify({"ok": False, "error": f"no window matching {title!r}"}), 404
+    with _input("keys"):
+        for win in _enum_windows():
+            candidate = (win.get("title") or "").casefold()
+            matched = candidate == needle if exact else needle in candidate
+            if matched:
+                current = next((item for item in _enum_windows()
+                                if item.get("_hwnd") == win.get("_hwnd")
+                                and (item.get("title") or "").casefold() == candidate), None)
+                if current is None:
+                    return jsonify({"ok": False, "error_code": "target_unavailable",
+                                    "error": "focus target disappeared"}), 409
+                if not _guarded_inject(_TypeOwnerGuard(), [False], _activate_window, current):
+                    return (
+                        jsonify(
+                            {
+                                "ok": False,
+                                "error": "activation failed",
+                                "window": _shape_window(win),
+                            }
+                        ),
+                        409,
+                    )
+                return jsonify({"ok": True, "window": _shape_window(win)})
+        return jsonify({"ok": False, "error": f"no window matching {title!r}"}), 404
 
 
 # ---------------------------------------------- UI Automation tree (opt-in)
@@ -2715,9 +3421,11 @@ class _WindowsClipboardBackend:
         # clipboard on the PC; it shipped because this backend never
         # runs off Windows and no test faked _setup.
         nbytes = ctypes.sizeof(data)
+        self.changed = False
         if not user32.OpenClipboard(None):
             raise OSError("OpenClipboard failed")
         try:
+            self.changed = True  # EmptyClipboard is a mutation
             user32.EmptyClipboard()
             handle = kernel32.GlobalAlloc(0x0002, nbytes)  # GMEM_MOVEABLE
             if not handle:
@@ -2749,6 +3457,7 @@ class _PyperclipBackend:
         return self._mod.paste() or ""
 
     def set_text(self, text):
+        self.changed = True
         self._mod.copy(text)
 
 
@@ -2773,11 +3482,14 @@ def clipboard_set():
     backend = _clipboard_backend()
     if backend is None:
         return jsonify({"ok": False, "error": "clipboard unavailable on this host"}), 501
-    try:
-        backend.set_text(text)
-    except Exception as exc:
-        return jsonify({"ok": False, "error": f"clipboard set failed: {exc}"}), 502
-    return {"ok": True}
+    with _input("keys"):
+        _before_effect()
+        try:
+            backend.set_text(text)
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"clipboard set failed: {exc}"}), 502
+        return {"ok": True}
+
 
 
 @app.get("/clipboard/get")

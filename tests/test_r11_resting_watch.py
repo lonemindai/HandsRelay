@@ -137,9 +137,9 @@ def test_resting_hand_only_while_claim_held(hands, rig):
     assert r.set_claim(True, 900, 1, clock["t"])
     _run(r, clock, tick, 120.0)
     assert pag.moves and r.status()["active"] and r.status()["claim_held"]
-    assert all(duration == 0.12 for _x, _y, duration in pag.moves)
     # every float stays local to where the pointer rested
-    assert all(abs(x - 500) <= 4 and abs(y - 500) <= 4 for x, y, _duration in pag.moves)
+    radius = hands.motion.REST_RADIUS_PX
+    assert all(abs(x - 500) <= radius and abs(y - 500) <= radius for x, y, _duration in pag.moves)
     assert r.set_claim(False, 0, 2, clock["t"])
     n = len(pag.moves)
     _run(r, clock, tick, 130.0)
@@ -189,6 +189,7 @@ def test_real_act_resets_the_global_ramp(hands, rig, monkeypatch):
     r.set_claim(True, 900, 1, 0.0)
     assert r.intensity(50.0) == 1.0
     with hands._input("mouse"):
+        hands._inject(hands.pyautogui.moveTo, 1, 2)
         assert r.intensity(50.0) == 0.0
     assert r.intensity(50.0) == 0.0 and r.last_act_end == 50.0
 

@@ -285,23 +285,20 @@ Plain `POST /v1/act` surfaces that as-is and is unchanged.
 `POST /v1/act/queued` takes the same body plus optional `hold_seconds`
 (default 30, clamped 1–120):
 
-- Any result other than a yield-`409` is returned exactly as `/v1/act`
-  would return it, plus the `id` of a receipt filed for it (every
-  submission files one, so a lost response can still be reconciled).
-- A yield-`409` (`error_code` `"yield"` / `"locked"`; older hands: error
-  mentions "yield" / "user active") files a receipt and answers
-  `202 {"queued": true, "id": ..., "state": "held"}`. A retry thread
-  re-forwards held acts in submission order, about once a second, until
-  their deadlines: a non-`409` answer settles the receipt `applied`,
-  still-`409` at the deadline settles it `refused-yielded`, and an
-  unreachable hands settles it `failed`. **A held act is never forwarded
-  once its deadline has passed** — if an earlier act (say a long `type`)
-  kept the retry thread busy past it, it settles `refused-yielded` instead
-  of landing late.
-- `GET /v1/act/queued/<id>` returns the receipt; an unknown or evicted
-  id answers `404` with `"state": "expired"`. `GET /v1/act/queued`
-  lists receipt summaries (`id`, `op`, `state`, `submitted_at`), newest
-  first. At most 200 receipts are kept.
+- Every queued submission has an in-memory receipt identity before dispatch.
+  A validated successful injection response settles `applied`; this does not
+  prove the target application achieved its intended effect.
+- Only structured, verified no-effect owner/lock refusals may become `held`.
+  Malformed/lost/contradictory responses terminate as `unknown-outcome`
+  (HTTP 502, `error_code: unknown_outcome`), never automatic replay.
+- Valid owner aborts with partial counts settle `aborted-owner`; lock or
+  foreground aborts settle `aborted`. Counts describe injection calls, not
+  document contents. Neither these states nor `failed` authorizes blind replay.
+- `GET /v1/act/queued/<id>` returns the receipt; absent/evicted IDs return
+  HTTP 404 with `state: unavailable`. Absence is not proof of nonexecution.
+  `GET /v1/act/queued` lists summaries, newest first; at most 200 are retained.
+  Gateway restart loses this history. Durable recovery/exactly-once desktop
+  effects are not provided.
 - A receipt records the op and the payload's **key names only — never
   payload values** (typed text may be sensitive). The payload itself is
   held in memory only while the receipt is held and dropped when it

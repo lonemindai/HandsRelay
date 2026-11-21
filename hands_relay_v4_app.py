@@ -413,6 +413,29 @@ def _watcher_activity(value, now):
     return result
 
 
+
+
+def _watcher_observations(value):
+    """Contact names stay in _watchers_or_empty. This is observation."""
+    if not isinstance(value, list):
+        return []
+    allowed = {"fresh", "error", "stale", "paused", "unknown"}
+    rows = []
+    for item in value:
+        if not isinstance(item, dict) or not item.get("holder"):
+            continue
+        label = item.get("observation")
+        rows.append({
+            "holder": str(item["holder"]),
+            "observation": label if label in allowed else "unknown",
+            "stale": item.get("stale") if isinstance(item.get("stale"), bool) else False,
+            "last_fetch_ok": item.get("last_fetch_ok") if isinstance(item.get("last_fetch_ok"), bool) else None,
+        })
+    return rows
+
+
+
+
 def _agent_mode(claim_model, watchers, paused_watchers=()):
     """R11 (#5): what the connected agent(s) are doing. A claim holder is
     in hands control; anyone watching without the claim is a watcher;
@@ -518,6 +541,10 @@ def build_dashboard_model(info, claim, queue, reserved_for, receipts, now):
     ]
     # A claim holder can still poll; do not hide its heartbeat from the tracker.
     watcher_activity = _watcher_activity(watcher_records, now)
+    observations = [
+        row for row in _watcher_observations(watcher_records)
+        if not claim_model or row["holder"] != claim_model["holder"]
+    ]
     wt = _finite_or_none(info_dict.get("watcher_timeout_seconds"))
     return {
         "services": services,
@@ -527,12 +554,15 @@ def build_dashboard_model(info, claim, queue, reserved_for, receipts, now):
         "watchers_paused": paused_watchers,
         "watchers_stopped": _stopped_watchers(info_dict.get("watchers_stopped"), now),
         "watcher_activity": watcher_activity,
+        "observations": observations,
         "watcher_timeout_s": wt,
+        "watcher_stale_s": _finite_or_none(info_dict.get("watcher_stale_seconds")),
         "queue_len": len(queue) if isinstance(queue, list) else 0,
         "reserved_for": str(reserved_for) if reserved_for else None,
         "pc": pc,
         "feed": summarize_receipts(receipts, now),
         "counts": receipt_state_counts(receipts),
+        "sync": info_dict.get("claim_sync") if isinstance(info_dict.get("claim_sync"), dict) else None,
     }
 
 
@@ -555,6 +585,9 @@ def format_diagnostics(model, stamp):
         lines.append(text)
     else:
         lines.append("Claim: none")
+    sync = model.get("sync")
+    if isinstance(sync, dict):
+        lines.append("Claim sync: " + ("ok" if sync.get("ok") else "degraded"))
     mode = model.get("mode")
     if mode is not None:
         text = {"control": "Mode: hands control", "watcher": "Mode: watcher",
@@ -567,6 +600,12 @@ def format_diagnostics(model, stamp):
         if model.get("watcher_timeout_s") is not None:
             text += f" · watcher timeout {_fmt_duration(model['watcher_timeout_s'])}"
         lines.append(text)
+    observations = model.get("observations") or []
+    if observations:
+        lines.append(
+            "Observation: "
+            + ", ".join(f"{row['holder']} {row['observation']}" for row in observations)
+        )
     extra = []
     if model.get("queue_len"):
         extra.append(f"queue: {model['queue_len']} waiting")

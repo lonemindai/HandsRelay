@@ -20,11 +20,15 @@
   const SERVICES = ["hands", "gateway", "parser"];
   const STATE_CHIP = {
     applied: "chip-ok", held: "chip-held", "refused-yielded": "chip-bad",
-    "aborted-owner": "chip-owner", failed: "chip-bad", expired: "chip-quiet",
+    failed: "chip-bad", expired: "chip-quiet",
+    "unknown-outcome": "chip-held", "aborted-owner": "chip-owner",
+    aborted: "chip-bad", unavailable: "chip-quiet", "in-flight": "chip-info",
   };
   const STATE_COLOR = {
     applied: "#3ddc97", held: "#ffb547", "refused-yielded": "#ff7a59",
-    "aborted-owner": "#ffb547", failed: "#ff5c6c", expired: "#5b6376",
+    failed: "#ff5c6c", expired: "#5b6376",
+    "unknown-outcome": "#ffb547", "aborted-owner": "#ffb547",
+    aborted: "#ff5c6c", unavailable: "#5b6376", "in-flight": "#7a8cff",
   };
 
   let logSeq = 0;
@@ -162,10 +166,15 @@
       modeText = "—";
     }
     setText($("agent-mode"), modeText, modeCls);
-    $("agent-mode").title = watchers.length ? `Watching (eyes only): ${watchers.join(", ")}` : "Watcher: eyes only (screen polling, no actuation). Hands control: claim held.";
+    const observations = (m && m.observations) || [];
+    const observed = observations.map((row) => `${row.holder}: ${row.observation}`);
+    $("agent-mode").title = observed.length
+      ? `Contact is not observation. ${observed.join(", ")}`
+      : (watchers.length ? `Watching (eyes only): ${watchers.join(", ")}` : "Watcher: eyes only (screen polling, no actuation). Hands control: claim held.");
     const wt = m && m.watcher_timeout_s;
     const parts = [];
     if (watchers.length) parts.push(mode === "watcher" ? watchers.join(", ") : `${watchers.length} watching`);
+    if (observed.length) parts.push(observed.join(", "));
     parts.push(wt == null ? "watcher timeout —" : `watcher timeout ${dur(wt)}`);
     const activity = (m && m.watcher_activity) || [];
     if (activity.length) {

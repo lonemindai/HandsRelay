@@ -23,11 +23,13 @@ into the gateway's environment). Agent calls are translated:
 """
 
 import base64
+import contextvars
+import math
 import binascii
 import hashlib
 import hmac
+import importlib.util
 import json
-import math
 import os
 import queue as _queue_mod
 import subprocess
@@ -39,6 +41,8 @@ from io import BytesIO
 
 import requests
 from flask import Flask, Response, abort, jsonify, request
+
+RELEASE = "v3 R13"  # this build's release identity, reported on /v1/info
 
 # Stripped (review E9): cmd's `set NAME=value && ...` keeps the trailing
 # space, which made the token and secret silently never match.
@@ -135,25 +139,134 @@ _claim_push_seq = 0
 _claim_push_session = requests.Session()
 
 
+_sync_latest = None
+_sync_running = False
+_sync_health = {"ok": True, "error": None, "epoch": None, "seq": None, "attempts": 0}
+SYNC_RETRY_MAX_S = 0.5
+
+
 def _post_claim_to_hands(payload):
     try:
-        _claim_push_session.post(
-            f"{HANDS_URL}/resting/claim", json=payload, headers=_hands_headers(), timeout=3
+        body = dict(payload)
+        if "epoch" in body and "challenge" not in body:
+            challenge = _claim_push_session.get(
+                f"{HANDS_URL}/resting/challenge", headers=_hands_headers(), timeout=3
+            )
+            issued = challenge.json()
+            body["challenge"] = issued["challenge"]
+            body["boot"] = issued["boot"]
+            payload["challenge"] = body["challenge"]
+            payload["boot"] = body["boot"]
+        return _claim_push_session.post(
+            f"{HANDS_URL}/resting/claim", json=body, headers=_hands_headers(), timeout=3
         )
-    except requests.RequestException:
-        pass  # the hands is down or older: no resting hand, nothing else changes
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return False  # retry the latest snapshot; do not drop it
+
+
+def _ack_ok(response, payload):
+    """None means a test replaced the sender. False means try again."""
+    if response is None:
+        return True
+    if response is False:
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    if not isinstance(body, dict) or body.get("ok") is not True or body.get("applied") is not True:
+        return False
+    if "epoch" not in payload:
+        return True
+    return (
+        body.get("boot") == payload.get("boot")
+        and body.get("epoch") == payload.get("epoch")
+        and body.get("seq") == payload.get("seq")
+        and body.get("claim_id") == payload.get("claim_id")
+    )
+
+
+def _sync_loop():
+    """One worker. A newer snapshot replaces one that has not been sent."""
+    global _sync_running, _sync_latest, _claim_push_seq
+    delay = 0.0
+    try:
+        while True:
+            if delay:
+                time.sleep(delay)
+            with _claim_lock:
+                payload = _sync_latest
+                _sync_latest = None
+            if payload is None:
+                return
+            response = _post_claim_to_hands(payload)
+            if _ack_ok(response, payload):
+                _sync_health.update({
+                    "ok": True, "error": None, "attempts": 0,
+                    "epoch": payload.get("epoch"), "seq": payload.get("seq"),
+                })
+                delay = 0.0
+                if _sync_latest is None:
+                    return
+                continue
+            _sync_health.update({
+                "ok": False,
+                "error": "unreachable" if response is False else "ack rejected",
+                "attempts": int(_sync_health.get("attempts") or 0) + 1,
+                "epoch": payload.get("epoch"),
+                "seq": payload.get("seq"),
+            })
+            delay = SYNC_RETRY_MAX_S if delay >= SYNC_RETRY_MAX_S else max(0.05, (delay or 0.025) * 2)
+            with _claim_lock:
+                if _sync_latest is None:
+                    _claim_push_seq += 1
+                    retried = dict(payload)
+                    retried["seq"] = _claim_push_seq
+                    retried.pop("challenge", None)
+                    retried.pop("boot", None)
+                    _sync_latest = retried
+    finally:
+        _sync_running = False
+        if _sync_latest is not None:
+            _ensure_sync_worker()
+
+
+def _ensure_sync_worker():
+    global _sync_running
+    if _sync_running:
+        return
+    _sync_running = True
+    threading.Thread(target=_sync_loop, args=(), daemon=True).start()
 
 
 def _push_claim_locked(claim, now):
-    """Queue a claim-state push to the hands; call with _claim_lock held."""
-    global _claim_push_seq
+    """Remember the latest claim snapshot and wake the one sync worker.
+
+    Call with _claim_lock held. A bound epoch store adds pairing, epoch,
+    and the stable claim id. The challenge is fetched when the worker
+    sends, not when the snapshot is taken.
+    """
+    global _claim_push_seq, _sync_latest
     _claim_push_seq += 1
     payload = {
         "held": claim is not None,
         "expires_in": max(0.0, float(claim["expires_at"]) - now) if claim else 0.0,
         "seq": _claim_push_seq,
     }
-    threading.Thread(target=_post_claim_to_hands, args=(payload,), daemon=True).start()
+    authority = _claim_authority
+    if authority is not None and authority.serving:
+        payload["epoch"] = authority.epoch
+        payload["pairing"] = authority.pairing
+        payload["claim_id"] = None if claim is None else claim.get("id")
+    _sync_latest = payload
+    _ensure_sync_worker()
+
+
+def reconcile_claim_snapshot():
+    """Startup: an absent claim is an explicit release, not silence."""
+    now = time.time()
+    with _claim_lock:
+        _push_claim_locked(_current_claim_locked(now), now)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +315,12 @@ def _watcher_timeout_setting():
 # released or times out is "stopped" and stays visible as such for
 # STOPPED_KEEP_SECONDS so the dashboard can say so honestly. Clients that
 # never pause see exactly the old behaviour plus a "state" field.
+#
+# v4-complete fold: the R13 observation model (B17/B18) rides on the same
+# entries. Contact (last_seen) never advances observation; a capture
+# attempt is recorded by _record_watcher_fetch. The R13 heartbeat flag
+# POST /v1/watch {paused: bool} is kept as a separate, sticky flag; either
+# kind of pause shows as state/observation "paused".
 WATCHER_PAUSE_DEFAULT = 900
 WATCHER_PAUSE_MIN = 30
 WATCHER_PAUSE_MAX = 3600
@@ -222,23 +341,69 @@ def _watcher_deadline(entry):
     return entry["last_seen"] + entry["timeout_seconds"]
 
 
-def _touch_watcher(holder, timeout_seconds=None, now=None):
+def _watcher_stale_setting():
+    """Explicit stale threshold S. Acceptance fixtures use 10 seconds.
+
+    This is not the contact timeout. A heartbeat can refresh contact
+    without making an old observation fresh.
+    """
+    raw = os.environ.get("WATCHER_STALE_SECONDS", "10")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 10.0
+    if not math.isfinite(value) or value <= 0:
+        return 10.0
+    return value
+
+
+def _blank_watcher(holder, now, timeout_seconds):
+    return {
+        "holder": holder,
+        "since": now,
+        "timeout_seconds": timeout_seconds,
+        "last_seen": now,
+        "last_success_at": None,
+        "last_fetch_ok": None,
+        "last_attempt_at": None,
+        "last_published_at": None,
+        "process_heartbeat_at": None,
+        "consecutive_failures": 0,
+        "last_error": None,
+        "observation_generation": 0,
+        "content_hash": None,
+        "content_changed_at": None,
+        "paused": False,
+        "state": "watching",
+    }
+
+
+def _watcher_entry_locked(holder, now):
+    """The live entry for holder, created fresh when absent or lapsed.
+    Caller holds _watch_lock."""
+    # Review L6: expire lapsed watchers on WRITE too, not only when
+    # someone reads /v1/info or /v1/watch, and cap distinct names.
+    _expire_watchers_locked(now)
+    if holder not in _watchers and len(_watchers) >= WATCHERS_MAX:
+        oldest = min(_watchers.values(), key=lambda e: e["last_seen"])
+        del _watchers[oldest["holder"]]
+    entry = _watchers.get(holder)
+    if entry is None:
+        entry = _blank_watcher(holder, now, _watcher_timeout)
+        _watchers[holder] = entry
+    _stopped_watchers.pop(holder, None)
+    return entry
+
+
+def _touch_watcher(holder, timeout_seconds=None, now=None, heartbeat=False, paused=None):
+    """Refresh contact. Never advances a validated observation."""
     holder = str(holder or "").strip()[:80]
     if not holder:
         return None
     now = time.time() if now is None else now
     default = _watcher_timeout_setting()
     with _watch_lock:
-        # Review L6: expire lapsed watchers on WRITE too, not only when
-        # someone reads /v1/info or /v1/watch, and cap distinct names.
-        _expire_watchers_locked(now)
-        if holder not in _watchers and len(_watchers) >= WATCHERS_MAX:
-            oldest = min(_watchers.values(), key=lambda e: e["last_seen"])
-            del _watchers[oldest["holder"]]
-        entry = _watchers.get(holder)
-        if entry is None:
-            entry = {"holder": holder, "since": now, "timeout_seconds": default}
-            _watchers[holder] = entry
+        entry = _watcher_entry_locked(holder, now)
         if timeout_seconds is not None:
             entry["timeout_seconds"] = _clamp_number(
                 timeout_seconds, default, WATCHER_TIMEOUT_MIN, WATCHER_TIMEOUT_MAX
@@ -248,8 +413,71 @@ def _touch_watcher(holder, timeout_seconds=None, now=None):
         for key in ("paused_at", "pause_timeout_seconds", "pause_reason"):
             entry.pop(key, None)
         entry["last_seen"] = now
-        _stopped_watchers.pop(holder, None)
-        return dict(entry)
+        if heartbeat:
+            entry["process_heartbeat_at"] = now
+        if paused is not None:
+            entry["paused"] = bool(paused)
+        return _public_watcher(entry, now)
+
+
+def _record_watcher_fetch(holder, ok, error=None, digest=None, now=None):
+    """Record one capture attempt. Failure does not move last_success_at."""
+    holder = str(holder or "").strip()[:80]
+    if not holder:
+        return None
+    now = time.time() if now is None else now
+    _watcher_timeout_setting()
+    with _watch_lock:
+        entry = _watcher_entry_locked(holder, now)
+        # A capture is a touch (?watcher= resumes an item-32 pause).
+        entry["state"] = "watching"
+        for key in ("paused_at", "pause_timeout_seconds", "pause_reason"):
+            entry.pop(key, None)
+        entry["last_seen"] = now
+        entry["last_attempt_at"] = now
+        entry["last_fetch_ok"] = bool(ok)
+        if ok:
+            entry["last_success_at"] = now
+            entry["consecutive_failures"] = 0
+            entry["last_error"] = None
+            entry["observation_generation"] = int(entry.get("observation_generation") or 0) + 1
+            if digest is not None and digest != entry.get("content_hash"):
+                entry["content_hash"] = digest
+                entry["content_changed_at"] = now
+        else:
+            entry["consecutive_failures"] = int(entry.get("consecutive_failures") or 0) + 1
+            entry["last_error"] = error or "fetch_failed"
+        return _public_watcher(entry, now)
+
+
+def _watcher_success_age(entry, now):
+    success = entry.get("last_success_at")
+    if isinstance(success, bool) or not isinstance(success, (int, float)):
+        return None
+    if not math.isfinite(float(success)):
+        return None
+    return now - float(success)
+
+
+def _public_watcher(entry, now):
+    """Copy plus the label a client can show. Contact is not observation."""
+    out = dict(entry)
+    age = _watcher_success_age(entry, now)
+    stale = age is not None and age >= _watcher_stale_setting()
+    if entry.get("paused") or entry.get("state") == "paused":
+        label = "paused"
+    elif entry.get("last_fetch_ok") is False:
+        label = "error"
+    elif age is None:
+        label = "unknown"
+    elif stale:
+        label = "stale"
+    else:
+        label = "fresh"
+    out["state"] = "paused" if label == "paused" else "watching"
+    out["stale"] = stale
+    out["observation"] = label
+    return out
 
 
 def _pause_watcher(holder, reason=None, timeout_seconds=None, now=None):
@@ -259,7 +487,7 @@ def _pause_watcher(holder, reason=None, timeout_seconds=None, now=None):
     if not holder:
         return None
     now = time.time() if now is None else now
-    entry = _touch_watcher(holder, now=now)
+    _touch_watcher(holder, now=now)
     with _watch_lock:
         entry = _watchers.get(holder)
         if entry is None:  # evicted between the two locks; vanishingly rare
@@ -271,7 +499,7 @@ def _pause_watcher(holder, reason=None, timeout_seconds=None, now=None):
             WATCHER_PAUSE_DEFAULT, WATCHER_PAUSE_MIN, WATCHER_PAUSE_MAX,
         )
         entry["pause_reason"] = str(reason).strip()[:120] if reason else ""
-        return dict(entry)
+        return _public_watcher(entry, now)
 
 
 def _release_watcher(holder, now=None):
@@ -293,11 +521,11 @@ def _expire_watchers_locked(now):
 
 def _current_watchers(now=None):
     """Live watchers (lazy expiry), oldest first. Each carries "state":
-    "watching" or "paused" (item 32)."""
+    "watching" or "paused" (item 32) and the R13 observation label."""
     now = time.time() if now is None else now
     with _watch_lock:
         _expire_watchers_locked(now)
-        return sorted((dict(e) for e in _watchers.values()), key=lambda e: e["since"])
+        return sorted((_public_watcher(e, now) for e in _watchers.values()), key=lambda e: e["since"])
 
 
 def _stopped_watcher_list(now=None):
@@ -734,6 +962,7 @@ def info():
     return jsonify(
         {
             "ok": True,
+            "release": RELEASE,
             "hands_url": HANDS_URL,
             "hands_secret_configured": bool(HANDS_SECRET),
             "hands_reachable": hands_ok,
@@ -745,6 +974,8 @@ def info():
             "watchers_stopped": _stopped_watcher_list(),
             "watcher_timeout_seconds": _watcher_timeout_setting(),
             "paused": PAUSED,
+            "watcher_stale_seconds": _watcher_stale_setting(),
+            "claim_sync": dict(_sync_health),
         }
     )
 
@@ -765,7 +996,12 @@ def watch_status():
 def watch_touch():
     """{holder, timeout_seconds?}: start or refresh watcher (eyes-only) mode."""
     body = _json_body()
-    entry = _touch_watcher(body.get("holder"), body.get("timeout_seconds"))
+    paused = body.get("paused") if "paused" in body else None
+    if paused is not None and not isinstance(paused, bool):
+        return jsonify({"ok": False, "error": "paused must be a boolean"}), 400
+    entry = _touch_watcher(
+        body.get("holder"), body.get("timeout_seconds"), heartbeat=True, paused=paused
+    )
     if entry is None:
         return jsonify({"ok": False, "error": "holder is required"}), 400
     return jsonify({"ok": True, "watcher": entry})
@@ -930,6 +1166,7 @@ def hands_claim():
             "purpose": purpose,
             "since": now,
             "expires_at": now + ttl,
+            "id": uuid.uuid4().hex,
         }
         _claim_refreshed_at = now
         _push_claim_locked(_claim, now)
@@ -1157,6 +1394,55 @@ def elevate_status(eid):
     return _hands_forward("GET", f"/elevate/{eid}")
 
 
+_capture_tls = threading.local()
+_CAPTURE_RESPONSE_HEADERS = (
+    "X-Screen-Width",
+    "X-Screen-Height",
+    "X-Screen-Monitor",
+    "X-Screen-Region",
+    "X-Screen-Origin",
+    "X-Screen-Surface",
+    "X-Screen-Rect",
+)
+
+
+def _variant_key(monitor=None, region=None):
+    """Identity of one capture. A pixel hash alone is not this identity."""
+    if monitor is not None:
+        return f"monitor={int(monitor)}"
+    if region is not None:
+        return f"region={region}"
+    return "legacy"
+
+
+def _header_value(headers, name):
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return None
+    return getter(name)
+
+
+def _capture_meta_from(headers, monitor, region):
+    """Copy variant headers, or None when they describe a different capture."""
+    monitor_header = _header_value(headers, "X-Screen-Monitor")
+    region_header = _header_value(headers, "X-Screen-Region")
+    if monitor is None and region is None:
+        if monitor_header not in (None, "") or region_header not in (None, ""):
+            return None
+    if monitor is not None and monitor_header not in (None, "") and str(monitor_header) != str(int(monitor)):
+        return None
+    if region is not None and region_header not in (None, "") and str(region_header) != str(region):
+        return None
+    meta = {}
+    for name in _CAPTURE_RESPONSE_HEADERS:
+        value = _header_value(headers, name)
+        if value not in (None, ""):
+            meta[name] = str(value)
+    return meta
+
+
 def _fetch_screenshot(monitor=None, region=None):
     """One screenshot from the hands.
 
@@ -1205,6 +1491,16 @@ def _fetch_screenshot(monitor=None, region=None):
             jsonify({"ok": False, "error": f"hands returned {r.status_code}"}),
             502,
         )
+    meta = _capture_meta_from(r.headers, monitor, region)
+    if meta is None:
+        return None, None, (
+            jsonify(
+                {"ok": False, "error": "capture metadata does not match the requested variant"}
+            ),
+            502,
+        )
+    _capture_tls.meta = meta
+    _capture_tls.variant = _variant_key(monitor, region)
     return r.content, r.headers.get("Content-Type", "image/png"), None
 
 
@@ -1337,30 +1633,44 @@ def screen():
     the gateway can decode images; a matching If-None-Match gets a 304
     so pollers can skip re-downloading unchanged frames.
     """
-    if request.args.get("watcher"):
-        _touch_watcher(request.args.get("watcher"))  # R11 watcher mode
+    holder = request.args.get("watcher")
     kwargs, err = _screen_fetch_kwargs()
     if err is not None:
         return err
+    _capture_tls.meta = None
+    _capture_tls.variant = None
     png, content_type, err = _fetch_screenshot(**kwargs)
     if err is not None:
+        _record_watcher_fetch(holder, False, error="fetch_failed")
         return err
     if TRAJECTORY_RECORDING and isinstance(png, (bytes, bytearray)):
         _trajectory_screen(bytes(png))
     resp = Response(png, content_type=content_type)
+    meta = getattr(_capture_tls, "meta", None) or {}
+    variant = getattr(_capture_tls, "variant", None) or _variant_key(
+        kwargs.get("monitor"), kwargs.get("region")
+    )
+    for name, value in meta.items():
+        resp.headers[name] = value
+    resp.headers["X-Screen-Variant"] = variant
     try:
         digest, _, _ = _frame_hash(png, None, DEFAULT_MASK_BOTTOM)
     except _HashUnavailable:
+        _record_watcher_fetch(holder, False, error="decode_unavailable")
         return resp
-    except _UndecodableFrame as exc:
-        # Review E7: serve the bytes as received, just without an ETag,
-        # rather than failing the whole route with an HTML 500.
-        app.logger.warning("screen frame not decodable for ETag: %s", exc)
-        return resp
-    etag = f'"{digest}"'
-    resp.headers["ETag"] = etag
+    except (_UndecodableFrame, OSError, ValueError) as exc:
+        # Review E7 (never an HTML 500) under the R13 freshness model: an
+        # undecodable capture is a JSON 502 and never counts as a fresh
+        # observation for the watcher.
+        app.logger.warning("screen frame not decodable: %s", exc)
+        _record_watcher_fetch(holder, False, error="invalid_capture")
+        return jsonify({"ok": False, "error": "capture could not be validated"}), 502
+    # A 304 below still validated this new capture. Contact alone does not.
+    _record_watcher_fetch(holder, True, digest=digest)
+    token = f"{variant}:{digest}"
+    resp.headers["ETag"] = f'"{token}"'
     inm = (request.headers.get("If-None-Match") or "").strip()
-    if inm and inm.strip('"') == digest:
+    if inm and inm.strip('"') == token:
         resp.status_code = 304
         resp.set_data(b"")
     return resp
@@ -1377,8 +1687,7 @@ def screen_hash():
     agree, so a blinking caret cannot flip the result. ?monitor=N /
     ?region=x,y,w,h select the capture variant being hashed.
     """
-    if request.args.get("watcher"):
-        _touch_watcher(request.args.get("watcher"))  # R11 watcher mode
+    holder = request.args.get("watcher")
     stable = (request.args.get("stable") or "").lower() in ("1", "true", "yes")
     try:
         mask_bottom = int(request.args.get("mask_bottom", DEFAULT_MASK_BOTTOM))
@@ -1389,19 +1698,24 @@ def screen_hash():
     kwargs, err = _screen_fetch_kwargs()
     if err is not None:
         return err
+    _capture_tls.meta = None
+    _capture_tls.variant = None
     png_a, _, err = _fetch_screenshot(**kwargs)
     if err is not None:
+        _record_watcher_fetch(holder, False, error="fetch_failed")
         return err
     png_b = None
     if stable:
         time.sleep(STABLE_SAMPLE_GAP)
         png_b, _, err = _fetch_screenshot(**kwargs)
         if err is not None:
+            _record_watcher_fetch(holder, False, error="fetch_failed")
             return err
     size_match = []
     try:
         digest, width, height = _frame_hash(png_a, png_b, mask_bottom, size_match)
     except _HashUnavailable:
+        _record_watcher_fetch(holder, False, error="decode_unavailable")
         return (
             jsonify(
                 {
@@ -1411,8 +1725,10 @@ def screen_hash():
             ),
             501,
         )
-    except _UndecodableFrame:
+    except (_UndecodableFrame, OSError, ValueError):
+        _record_watcher_fetch(holder, False, error="invalid_capture")
         return _undecodable_response()
+    _record_watcher_fetch(holder, True, digest=digest)
     return jsonify(
         {
             "ok": True,
@@ -1421,6 +1737,10 @@ def screen_hash():
             "mask_bottom": mask_bottom,
             "width": width,
             "height": height,
+            "variant": getattr(_capture_tls, "variant", None) or _variant_key(
+                kwargs.get("monitor"), kwargs.get("region")
+            ),
+            "capture": getattr(_capture_tls, "meta", None) or {},
         }
     )
 
@@ -1435,8 +1755,7 @@ def screen_wait():
     Single-sample (not the two-frame stable composite) so a 25s hold is not
     a chain of 0.65s gaps.
     """
-    if request.args.get("watcher"):
-        _touch_watcher(request.args.get("watcher"))  # R11 watcher mode
+    holder = request.args.get("watcher")
     since = request.args.get("since", request.args.get("hash", ""))
     if not isinstance(since, str):
         since = ""
@@ -1455,16 +1774,20 @@ def screen_wait():
     kwargs, err = _screen_fetch_kwargs()
     if err is not None:
         return err
+    _capture_tls.meta = None
+    _capture_tls.variant = None
     deadline = time.monotonic() + timeout
     timed_out = True
     digest = width = height = None
     while True:
         png, _, err = _fetch_screenshot(**kwargs)
         if err is not None:
+            _record_watcher_fetch(holder, False, error="fetch_failed")
             return err
         try:
             digest, width, height = _frame_hash(png, None, mask_bottom)
         except _HashUnavailable:
+            _record_watcher_fetch(holder, False, error="decode_unavailable")
             return (
                 jsonify(
                     {
@@ -1474,7 +1797,8 @@ def screen_wait():
                 ),
                 501,
             )
-        except _UndecodableFrame:
+        except (_UndecodableFrame, OSError, ValueError):
+            _record_watcher_fetch(holder, False, error="invalid_capture")
             return _undecodable_response()
         if digest != since:
             timed_out = False
@@ -1483,6 +1807,7 @@ def screen_wait():
         if remaining <= 0:
             break
         time.sleep(min(0.2, remaining))
+    _record_watcher_fetch(holder, True, digest=digest)
     return jsonify(
         {
             "ok": True,
@@ -1492,6 +1817,10 @@ def screen_wait():
             "mask_bottom": mask_bottom,
             "width": width,
             "height": height,
+            "variant": getattr(_capture_tls, "variant", None) or _variant_key(
+                kwargs.get("monitor"), kwargs.get("region")
+            ),
+            "capture": getattr(_capture_tls, "meta", None) or {},
         }
     )
 
@@ -1567,13 +1896,113 @@ def _store_receipt(receipt, payload=None):
             # Mark it BEFORE dropping it: the retry loop may already hold
             # a reference to this dict, and _pump_receipt only forwards
             # receipts whose state is still "held".
-            if evicted["state"] == "held":
+            evicted["_evicted"] = True
+            if evicted.get("_dispatching") or evicted["state"] == "in-flight":
+                evicted["state"] = "unknown-outcome"
+            elif evicted["state"] == "held":
                 evicted["state"] = "expired"
             _pending_payloads.pop(victim, None)
 
 
 def _public_receipt(receipt):
     return {k: v for k, v in receipt.items() if not k.startswith("_")}
+
+
+def _held_failure_diagnostics(result):
+    """Retain bounded structured evidence without payload echoes.
+
+    Deliberately omit arbitrary error/debug strings. This is diagnostic
+    retention only; terminal-state classification remains unchanged.
+    """
+    if not isinstance(result, dict):
+        return {"ok": False}
+    safe = {"ok": False}
+    enums = {
+        "error_code": {"type_aborted", "input_aborted", "foreground_changed", "locked",
+                       "yield", "owner_active", "burst", "claim_held"},
+        "abort_reason": {"owner", "locked", "foreground_changed"},
+        "owner_guard": {"hook", "dwtime", "none", None},
+        "method_used": {"keys", "paste"},
+    }
+    for key, allowed in enums.items():
+        value = result.get(key)
+        if key in result and isinstance(value, (str, type(None))) and value in allowed:
+            safe[key] = value
+    # Hands caps the entire JSON request at 1,000,000 bytes.
+    # This accommodates every supported input character count.
+    for key in ("chars", "chars_typed"):
+        value = result.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
+            safe[key] = value
+    if ("chars" in safe and "chars_typed" in safe
+            and safe["chars_typed"] > safe["chars"]):
+        safe.pop("chars")
+        safe.pop("chars_typed")
+    if isinstance(result.get("aborted"), bool):
+        safe["aborted"] = result["aborted"]
+    return safe
+
+
+def classify_act_outcome(status, result):
+    """Classify injection evidence, never application success or transport guesses.
+
+    Return (state, HTTP status, copied privacy-safe evidence). Bare boolean
+    ok is the existing hands completion contract; contradictory evidence
+    invalidates it. Only coded, zero-effect refusals may be retried.
+    """
+    unknown = ("unknown-outcome", 502,
+               {"ok": False, "error_code": "unknown_outcome"})
+    if (not isinstance(result, dict) or type(result.get("ok")) is not bool
+            or type(status) is not int):
+        return unknown
+    if result.get("error_code") == "unknown_outcome":
+        return unknown
+    counts = {}
+    for key in ("chars", "chars_typed"):
+        if key in result:
+            v = result[key]
+            if type(v) is not int or not 0 <= v <= 1_000_000:
+                return unknown
+            counts[key] = v
+    if (len(counts) == 2 and counts["chars_typed"] > counts["chars"]):
+        return unknown
+    safe = _held_failure_diagnostics(result)
+    if result["ok"]:
+        if (not 200 <= status < 300 or result.get("aborted")
+                or result.get("error_code") or result.get("abort_reason")
+                or (len(counts) == 2 and counts["chars_typed"] != counts["chars"])):
+            return unknown
+        safe["ok"] = True
+        return "applied", status, safe
+    code = result.get("error_code")
+    if code == "deadline_expired":
+        safe["error_code"] = code
+        return "refused-yielded", status, safe
+    # v4 yield reasons: owner_active (owner at the desk), burst (hands
+    # lockout), locked; "yield" is the pre-v4 hands spelling.
+    if code in {"yield", "owner_active", "burst", "locked"} and status == 409:
+        if result.get("aborted") or result.get("abort_reason") or counts.get("chars_typed", 0):
+            return unknown
+        return "held", status, safe
+    if result.get("aborted") is True:
+        reason = result.get("abort_reason")
+        if reason == "owner" and "chars_typed" in counts:
+            return "aborted-owner", status, safe
+        if reason in {"locked", "foreground_changed"}:
+            return "aborted", status, safe
+    if code in {"operation_failed", "configuration_error", "invalid_operation", "capability_refused", "deadline_expired"}:
+        safe["error_code"] = code
+    return "failed", status, safe
+
+
+def _attempt_act(op, payload):
+    # An arbitrary forwarding exception cannot prove non-dispatch.
+    try:
+        status, result = _forward_act(op, payload)
+    except Exception:
+        status, result = 502, {"ok": False, "error_code": "unknown_outcome"}
+    state, status, safe = classify_act_outcome(status, result)
+    return state, status, safe, result
 
 
 def _pump_receipt(receipt, now):
@@ -1587,7 +2016,7 @@ def _pump_receipt(receipt, now):
     refused-yielded WITHOUT forwarding (review E2).
     """
     with _receipts_lock:
-        if receipt.get("state") != "held":
+        if receipt.get("state") != "held" or receipt.get("_dispatching"):
             return receipt
         if receipt["id"] not in _pending_payloads:
             # The payload is gone (evicted or settled elsewhere). NEVER
@@ -1597,47 +2026,43 @@ def _pump_receipt(receipt, now):
             receipt["state"] = "expired"
             receipt["updated_at"] = now
             return receipt
-        if now >= receipt["deadline"]:
-            # Review E2: never START a forward after the hold window. The
-            # retry loop is serial (it must preserve submission order), so
-            # a slow act -- a long type runs for minutes -- can delay the
-            # next receipt's turn past its deadline; forwarding it then
-            # would land input long after the caller's hold had lapsed.
-            # Its last attempt was a yield, so it settles refused-yielded.
-            receipt["state"] = "refused-yielded"
-            receipt["updated_at"] = now
+        deadline = receipt.get("_deadline_mono", receipt.get("deadline"))
+        current = time.monotonic() if "_deadline_mono" in receipt else now
+        if (type(deadline) not in (int, float) or not math.isfinite(deadline)
+                or current >= deadline):
+            receipt.update(state="refused-yielded", updated_at=time.time(),
+                           result={"ok": False, "error_code": "deadline_expired"})
             _pending_payloads.pop(receipt["id"], None)
             return receipt
+        receipt["_dispatching"] = True
         payload = dict(_pending_payloads[receipt["id"]])
         op = receipt["op"]
-    try:
-        status, result = _forward_act(op, payload)
-    except Exception as exc:  # a stubbed / broken forward must not kill the pump
-        status, result = None, {"ok": False, "error": f"forward failed: {exc}"}
-        failed = True
-        yielded = False
-    else:
-        yielded = _is_yield_conflict(status, result)
-        # 2xx applied. Yield-409 stays held (deadline still -> refused-yielded).
-        # Everything else, including 400/500/503/502 and a non-yield 409, fails.
-        failed = not (isinstance(status, int) and 200 <= status < 300)
+        context = receipt.get("_lease_context")
+    attempt_started = time.monotonic()
+    state, status, result, _ = _queued_attempt(op, payload, context)
+    yielded = state == "held"
     with _receipts_lock:
-        receipt["updated_at"] = now
+        receipt["_dispatching"] = False
+        # Eviction cannot turn an outstanding dispatch into never-started expiry.
+        if receipt.get("_evicted"):
+            receipt["state"] = "unknown-outcome"
+            receipt["result"] = {"ok": False, "error_code": "unknown_outcome"}
+            _pending_payloads.pop(receipt["id"], None)
+            return receipt
+        receipt["updated_at"] = time.time()
         if status is not None:
             receipt["hands_status"] = status
         if yielded:
-            if now >= receipt["deadline"]:
+            current = (time.monotonic() if "_deadline_mono" in receipt
+                       else now + (time.monotonic() - attempt_started))
+            if current >= deadline:
                 receipt["state"] = "refused-yielded"
+                receipt["result"] = {"ok": False, "error_code": "deadline_expired"}
                 _pending_payloads.pop(receipt["id"], None)
             return receipt
-        if failed or status is None:
-            owner_abort = (
-                isinstance(result, dict)
-                and result.get("error_code") == "type_aborted"
-                and result.get("abort_reason") == "owner"
-            )
-            receipt["state"] = "aborted-owner" if owner_abort else "failed"
-            receipt["result"] = result if owner_abort else None
+        if state != "applied":
+            receipt["state"] = state
+            receipt["result"] = result
             _pending_payloads.pop(receipt["id"], None)
             return receipt
         receipt["state"] = "applied"
@@ -1843,6 +2268,54 @@ def _claim_gate_act(op, payload, path=None):
     return status, result
 
 
+_execution_context = contextvars.ContextVar("execution_context", default=None)
+
+
+def _prepare_queued_execution(op, payload, hold):
+    """Negotiate before any protected action; failure never dispatches input."""
+    try:
+        response = requests.get(f"{HANDS_URL}/execution/capabilities",
+                                headers=_hands_headers(), timeout=HANDS_TIMEOUT)
+        caps = response.json()
+        if (response.status_code != 200 or not isinstance(caps, dict)
+                or caps.get("ok") is not True
+                or type(caps.get("execution_lease_version")) is not int
+                or caps["execution_lease_version"] != 1
+                or not isinstance(caps.get("boot"), str) or not caps["boot"]):
+            return None
+        # Pin before minting: the digest cannot change on a later retry.
+        hwnd = caps.get("foreground_hwnd")
+        instance = caps.get("process_instance")
+        # A locked desktop has no trustworthy foreground. Do not pin one.
+        if (caps.get("locked") is not True and "expect_focus" not in payload
+                and op != "focus" and type(hwnd) is int and hwnd > 0):
+            pin = {"hwnd": hwnd}
+            if isinstance(instance, str) and instance:
+                pin["process_instance"] = instance
+            payload["expect_focus"] = pin
+        response = requests.post(f"{HANDS_URL}/execution/lease",
+            headers=_hands_headers(), timeout=HANDS_TIMEOUT,
+            json={"op": op, "payload": payload, "hold_seconds": hold})
+        body = response.json()
+        lease = body.get("lease") if isinstance(body, dict) else None
+        if (response.status_code != 200 or body.get("ok") is not True
+                or not isinstance(lease, dict) or type(lease.get("version")) is not int
+                or lease["version"] != 1 or lease.get("boot") != caps["boot"]
+                or not isinstance(lease.get("token"), str) or not lease["token"]):
+            return None
+        return {k: lease[k] for k in ("version", "boot", "token")}
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _queued_attempt(op, payload, context):
+    token = _execution_context.set(context)
+    try:
+        return _attempt_act(op, payload)
+    finally:
+        _execution_context.reset(token)
+
+
 def _forward_act_once(op, payload, path=None):
     """Forward one act to the hands. Returns (status_code, json_dict).
 
@@ -1854,21 +2327,41 @@ def _forward_act_once(op, payload, path=None):
     if PAUSED:
         return 423, _paused_response()
     if not HANDS_SECRET:
-        return 503, {"ok": False, "error": "HANDS_SECRET not configured on gateway"}
+        return 503, {
+            "ok": False,
+            "error": "HANDS_SECRET not configured on gateway",
+            "error_code": "configuration_error",
+        }
     if path is None:
         # Review E6: a list/dict op used to raise TypeError (unhashable) -> 500.
         if not isinstance(op, str) or op not in HANDS_OPS:
-            return 400, {"ok": False, "error": f"unknown op: {_short(op)!r}"}
+            return 400, {
+                "ok": False,
+                "error": f"unknown op: {_short(op)!r}",
+                "error_code": "invalid_operation",
+            }
         path = HANDS_OP_PATHS.get(op, op)
+    context = _execution_context.get()
+    wire_payload = dict(payload)
+    if context is not None:
+        if context.get("lease") is None:
+            context["lease"] = _prepare_queued_execution(op, payload, context["hold"])
+            if context["lease"] is None:
+                return 409, {"ok": False, "error_code": "capability_refused"}
+        wire_payload = {**payload, "_execution_lease": context["lease"]}
     try:
         r = requests.post(
             f"{HANDS_URL}/{path}",
-            json=payload,
+            json=wire_payload,
             headers=_hands_headers(),
             timeout=_act_timeout(op, payload),
         )
     except requests.RequestException as exc:
-        return 502, {"ok": False, "error": f"hands unreachable: {exc}"}
+        return 502, {
+            "ok": False,
+            "error": f"hands unreachable: {exc}",
+            "error_code": "unknown_outcome",
+        }
     if r.status_code == 401:
         return 502, {
             "ok": False,
@@ -1877,7 +2370,7 @@ def _forward_act_once(op, payload, path=None):
     try:
         return r.status_code, r.json()
     except ValueError:
-        return r.status_code, {"ok": r.ok, "status": r.status_code}
+        return 502, {"ok": False, "error_code": "unknown_outcome"}
 def _act_timeout(op, payload):
     """Per-op timeout for the hands call (wishlist #9).
 
@@ -2004,8 +2497,8 @@ def act():
     """
     body = _json_body()
     op = body.get("op") or ""
-    payload = {k: v for k, v in body.items() if k != "op"}
-    status, result = _forward_act(op, payload)
+    payload = {k: v for k, v in body.items() if k != "op" and not k.startswith("_execution")}
+    _, status, result, _ = _attempt_act(op, payload)
     return jsonify(result), status
 
 
@@ -2337,24 +2830,30 @@ def act_queued():
     body = _json_body()
     op = body.get("op") or ""
     hold = _clamp_number(body.get("hold_seconds", HOLD_DEFAULT), HOLD_DEFAULT, HOLD_MIN, HOLD_MAX)
-    payload = {k: v for k, v in body.items() if k not in ("op", "hold_seconds")}
-    status, result = _forward_act(op, payload)
-    if not _is_yield_conflict(status, result):
+    payload = {k: v for k, v in body.items() if k not in ("op", "hold_seconds") and not k.startswith("_execution")}
+    submitted = time.time()
+    receipt = {"id": uuid.uuid4().hex, "op": op, "param_keys": sorted(payload),
+               "state": "in-flight", "submitted_at": submitted,
+               "updated_at": submitted, "deadline": submitted, "result": None}
+    _store_receipt(receipt)
+    context = {"hold": hold, "lease": None}
+    state, status, safe, result = _queued_attempt(op, payload, context)
+    if (state == "held" and isinstance(result, dict)
+            and result.get("error_code") == "locked"
+            and "expect_focus" not in payload):
+        state = "failed"
+        safe = {"ok": False, "error_code": "target_unknown"}
+    if state != "held":
         # R4 (F4): settle a receipt for the direct result too — no
         # payload is retained (nothing is held), and the id rides in
         # the response body so the caller can reconcile later.
         now = time.time()
-        applied = isinstance(status, int) and 200 <= status < 300
-        owner_abort = (
-            isinstance(result, dict)
-            and result.get("error_code") == "type_aborted"
-            and result.get("abort_reason") == "owner"
-        )
-        receipt = {
-            "id": uuid.uuid4().hex,
+        applied = state == "applied"
+        receipt.update({
+            "id": receipt["id"],
             "op": _short(op),
             "param_keys": _param_keys(payload),
-            "state": "applied" if applied else ("aborted-owner" if owner_abort else "failed"),
+            "state": state,
             # R9 (#21): which path settled it — "direct" here,
             # "after-hold" when the retry pump applies a held act.
             "applied_via": "direct" if applied else None,
@@ -2363,14 +2862,10 @@ def act_queued():
             "deadline": now,
             "hold_seconds": hold,
             "hands_status": status,
-            "result": result,
-        }
+            "result": safe,
+        })
         _store_receipt(receipt)
-        body = (
-            dict(result)
-            if isinstance(result, dict)
-            else {"ok": False, "error": str(result)}
-        )
+        body = dict(safe)
         body["id"] = receipt["id"]
         return jsonify(body), status
     now = time.time()
@@ -2385,13 +2880,14 @@ def act_queued():
         "expect_focus" not in payload
         and op != "focus"
         and isinstance(result, dict)
+        and result.get("error_code") != "locked"
         and isinstance(result.get("foreground_hwnd"), int)
         and not isinstance(result.get("foreground_hwnd"), bool)
     ):
         pinned = result["foreground_hwnd"]
         payload["expect_focus"] = {"hwnd": pinned}
-    receipt = {
-        "id": uuid.uuid4().hex,
+    receipt.update({
+        "id": receipt["id"],
         "op": op,
         "param_keys": _param_keys(payload, exclude=("expect_focus",) if pinned is not None else ()),
         "pinned_foreground": pinned is not None,
@@ -2399,10 +2895,12 @@ def act_queued():
         "submitted_at": now,
         "updated_at": now,
         "deadline": now + hold,
+        "_deadline_mono": time.monotonic() + hold,
+        "_lease_context": context,
         "hold_seconds": hold,
         "hands_status": status,
         "result": None,
-    }
+    })
     _store_receipt(receipt, payload)
     _ensure_receipt_thread()
     return (
@@ -2435,8 +2933,8 @@ def act_queued_get(receipt_id):
                 jsonify(
                     {
                         "ok": False,
-                        "error": "unknown or expired receipt id",
-                        "state": "expired",
+                        "error": "receipt unavailable; execution cannot be inferred",
+                        "state": "unavailable",
                     }
                 ),
                 404,
@@ -2975,9 +3473,40 @@ def dom_act():
     return _dom_call(fn)
 
 
+_claim_authority = None
+
+
+def bind_claim_authority(directory=None):
+    """Allocate this process's epoch before any claim traffic is served.
+
+    Failure is fail-closed: the process does not start. The directory is
+    the argument, else MUSE_RELAY_STATE_DIR, else services/gateway/state
+    beside this file. The returned store stays held until release().
+    """
+    global _claim_authority
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "epoch_store.py")
+    spec = importlib.util.spec_from_file_location("muse_gateway_epoch_store", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if directory is None:
+        directory = os.environ.get("MUSE_RELAY_STATE_DIR") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "state")
+    store = module.EpochStore(directory)
+    try:
+        held = store.acquire()
+    except module.SyncError as exc:
+        raise SystemExit(f"claim authority fail closed: {exc}") from exc
+    if not held:
+        raise SystemExit("another gateway holds claim authority")
+    _claim_authority = store
+    reconcile_claim_snapshot()
+    return store
+
+
 if __name__ == "__main__":
     from waitress import serve
 
+    bind_claim_authority()
     # R4 (F9): 8 threads starved act traffic whenever long-poll
     # endpoints (wait_for up to 300 s, screen/wait 25 s, a long type
     # forward up to 600 s) overlapped — every route, /v1/info
