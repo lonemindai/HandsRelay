@@ -84,6 +84,20 @@ def test_unnamed_caller_yield_names_the_holder(gw):
     assert "claimed by 'agent:muse:main'" in body["error"]
 
 
+def test_legacy_hands_yield_spelling_never_reaches_a_response(gw):
+    # Yield-reason bar: no bare "yield" in any response path, even when a
+    # pre-v4 hands still answers with it.
+    c = gw.app.test_client()
+    gw._hands_answer = (409, {"ok": False, "error": "user active", "error_code": "yield"})
+    r = c.post("/v1/act", json={"op": "click", "x": 1, "y": 2}, headers=H)
+    assert r.status_code == 409 and r.get_json()["error_code"] == "owner_active"
+    assert '"yield"' not in r.get_data(as_text=True)
+    r = c.post("/v1/act/queued", json={"op": "click", "x": 1, "y": 2, "hold_seconds": 5}, headers=H)
+    assert '"yield"' not in r.get_data(as_text=True)
+    rid = r.get_json()["id"]
+    assert '"yield"' not in c.get(f"/v1/act/queued/{rid}", headers=H).get_data(as_text=True)
+
+
 def test_status_is_read_only(gw):
     c = gw.app.test_client()
     r = c.get("/v1/hands/claim/status", headers=H)

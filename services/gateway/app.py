@@ -1928,6 +1928,10 @@ def _held_failure_diagnostics(result):
         value = result.get(key)
         if key in result and isinstance(value, (str, type(None))) and value in allowed:
             safe[key] = value
+    # v4 yield reasons: a pre-v4 hands still says "yield" for an owner at
+    # the desk; no response path repeats that bare spelling.
+    if safe.get("error_code") == "yield":
+        safe["error_code"] = "owner_active"
     # Hands caps the entire JSON request at 1,000,000 bytes.
     # This accommodates every supported input character count.
     for key in ("chars", "chars_typed"):
