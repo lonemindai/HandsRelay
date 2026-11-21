@@ -29,7 +29,7 @@ PROXY = "http://hatch-egress-proxy:3130"
 ABRAHAM = {
     "name": "abraham",
     "holder": "abraham",
-    "url": "http://<abraham-tailnet-ip>:5010/v1/screen",
+    "url": os.environ.get("WATCH_URL_ABRAHAM", "http://abraham:5010/v1/screen"),
     "home": "~/workspace",
     "live": "screen-live.png",
     "full": "screen-live-full.png",
@@ -42,7 +42,7 @@ ABRAHAM = {
 LAPTOP = {
     "name": "laptop",
     "holder": "laptop",
-    "url": "http://<laptop-tailnet-ip>:5010/v1/screen",
+    "url": os.environ.get("WATCH_URL_LAPTOP", "http://laptop:5010/v1/screen"),
     "home": "~/workspace/miata-logs",
     "live": "screen-laptop-live.png",
     "full": "screen-laptop-live-full.png",
