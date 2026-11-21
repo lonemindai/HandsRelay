@@ -121,6 +121,23 @@
     }
   }
 
+  // R14 (#34 smoothing, owner's call 2026-10-24): the server model
+  // recomputes expires_in_s on its 5 s controller poll, so rendering it
+  // verbatim steps in ~5 s jumps. Anchor each rendered value locally
+  // and count it down every second; every state render re-anchors from
+  // the server value, so the display can never drift more than one
+  // server poll behind reality.
+  let claimAnchor = null;
+
+  function tickClaimCountdown() {
+    if (!claimAnchor) return;
+    const left = Math.max(0, claimAnchor.left - (Date.now() - claimAnchor.at) / 1000);
+    setText($("claim-expiry"), `expires in ${dur(left)}`);
+    const pct = Math.max(2, Math.min(100, (left / 1800) * 100));
+    $("claim-meter").style.width = `${pct}%`;
+  }
+  setInterval(tickClaimCountdown, 1000);
+
   function renderClaim(m) {
     const claim = m && m.claim;
     $("claim").dataset.held = claim ? "1" : "0";
@@ -129,10 +146,12 @@
       setText($("claim-holder"), claim.holder);
       setText($("claim-purpose"), claim.purpose || "No purpose given");
       const left = claim.expires_in_s;
+      claimAnchor = left == null ? null : { left, at: Date.now() };
       setText($("claim-expiry"), left == null ? "no expiry" : `expires in ${dur(left)}`);
       const pct = left == null ? 100 : Math.max(2, Math.min(100, (left / 1800) * 100));
       $("claim-meter").style.width = `${pct}%`;
     } else {
+      claimAnchor = null;
       setText($("claim-holder"), "Free");
       setText($("claim-purpose"), m ? "No session holds the hands." : "—");
       setText($("claim-expiry"), "—");
@@ -329,6 +348,7 @@
     const phase = phaseOf(view);
     document.body.dataset.phase = phase;
     setText($("phase-text"), { idle: "Stopped", starting: "Starting…", running: "All systems running", degraded: "Attention needed" }[phase]);
+    setText($("brand-release"), (view.model && view.model.release) || "");
     $("btn-start").disabled = started || busy;
     $("btn-start").classList.toggle("is-running", started);
     setText($("start-label"), started ? "Running" : busy ? "Starting…" : "Start");

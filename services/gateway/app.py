@@ -42,7 +42,7 @@ from io import BytesIO
 import requests
 from flask import Flask, Response, abort, jsonify, request
 
-RELEASE = "v3 R13"  # this build's release identity, reported on /v1/info
+RELEASE = "v4.0"  # v4 on the v3 R14 lineage; this build's release identity, reported on /v1/info
 
 # Stripped (review E9): cmd's `set NAME=value && ...` keeps the trailing
 # space, which made the token and secret silently never match.
