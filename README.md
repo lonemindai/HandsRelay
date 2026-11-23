@@ -1,10 +1,10 @@
-# HandsRelay v4
+# HandsRelay v5
 
 Let a personal AI agent operate a Windows PC — screenshots,
 mouse, keyboard — with a security posture designed for leaving it reachable
 while the owner is away from home.
 
-HandsRelay v4 has three parts:
+HandsRelay v5 has three parts:
 
 | Part | Runs where | What it does |
 | --- | --- | --- |
@@ -13,6 +13,17 @@ HandsRelay v4 has three parts:
 | **parser** | Docker or native Python (GPU optional) | Screen parsing (OmniParser-class): screenshot in → labeled, numbered UI elements out, for surfaces with no DOM and no UI Automation tree (games, canvas, custom UI). Optional component; the relay works without it. |
 
 The project roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md); item dispositions and verification limits are in [docs/COMMISSION-CLOSEOUT.md](docs/COMMISSION-CLOSEOUT.md).
+
+## What's new in v5
+
+v5 adds two input changes on top of v4. Default typing behavior is unchanged.
+
+- **Real-key typing (opt-in).** `POST /type` accepts `method: "real_keys"`, for fields that reject paste. Each character is sent through Windows `SendInput` as a real key down and key up, with Shift wrapped around shifted characters and a Unicode down/up pair for characters that have no key on the active layout. It never touches the clipboard and never falls back to paste. Timing is a fixed 0.02 s per character, with no jitter. Off Windows the method answers `501 real_keys_unavailable`.
+- **Session-wide switch.** The Settings entry "Type with real key presses instead of pasting" (`type_real_keys`, off by default; environment variable `HANDS_REAL_KEYS`) makes `method: "auto"` use real keys. A method named in the request still wins.
+- **Owner input still wins.** Keyboard or mouse input from the person at the PC, a locked desktop, or a changed foreground window stops real-key typing. If nothing was typed yet, the request is refused with a 409. If typing had started, the response reports `type_aborted` and `chars_typed`.
+- **Clicks land on scaled displays.** The hands process is now explicitly DPI-aware, and each input request thread runs per-monitor-v2, so request coordinates are physical pixels on every monitor. This corrects clicks that missed their target when a monitor was set to 125% or 150% after logon. Screenshot routes use the same physical pixels.
+
+The executable, the autostart entry and `start-v4.bat` keep their `v4` names in this release, so the build still produces `HandsRelay v4.exe`.
 
 ## Prerequisites
 
@@ -412,12 +423,12 @@ never a real chord — nothing was interrupted. `/break` and `/hotkey`
 send true chords via `pyautogui.hotkey()`, so the interrupt lands.
 
 **Fast `/type`:** `POST /type` now also accepts
-`{method: "auto"|"paste"|"keys"}` (absent = the old behavior for short
+`{method: "auto"|"paste"|"keys"|"real_keys"}` (absent = the old behavior for short
 text). In `auto`, text over 120 chars goes through the clipboard when a
 backend exists: the current clipboard is saved, replaced with the text,
 pasted with Ctrl+V, then restored. Any clipboard failure falls back to
 keystrokes rather than failing, and the response reports what happened:
-`{"ok": true, "method_used": "paste"|"keys", "chars": n,
+`{"ok": true, "method_used": "paste"|"keys"|"real_keys", "chars": n,
 "elapsed_seconds": x}`. Paste responses also report `owner_guard`. Before injection, owner input, locking, or a changed foreground refuses the paste; after injection, a takeover reports `chars_typed` and `type_aborted` without replay. A paste already sent cannot be retracted. Queued owner aborts settle as `aborted-owner`, not as a relay failure. On the gateway, the act timeout for `type` is
 sized to the payload — `max(30, min(600, 15 + len(text)/6))` seconds,
 since the keystroke path runs at worst ~6 chars/s — while every other
