@@ -52,7 +52,7 @@ def store_status(path, status):
         os.makedirs(folder, exist_ok=True)
     tmp = os.path.join(folder or ".", f".status.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     payload = json.dumps(status, sort_keys=True).encode("utf-8")
-    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o644)
     try:
         os.write(fd, payload)
         os.fsync(fd)

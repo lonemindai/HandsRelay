@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE_COMMIT = "7d8de72"  # v4-rc1 just before the DOM merge (wave 1 + nested + uia): the gateway without the adapter
+BASE_COMMIT = "1b585ac"  # v4-rc1 just before the DOM merge (wave 1 + nested + uia): the gateway without the adapter
 _seq = itertools.count()
 
 

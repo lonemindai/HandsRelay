@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE = "925f9be"  # v4-toggles-wave1 head, before the agent browser
+BASE = "e755d66"  # v4-toggles-wave1 head, before the agent browser
 _seq = itertools.count()
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
 

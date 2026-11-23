@@ -22,7 +22,7 @@ class OutputLock:
         folder = os.path.dirname(self.path)
         if folder:
             os.makedirs(folder, exist_ok=True)
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o644)
         try:
             _lock_fd(fd)
         except (BlockingIOError, OSError):

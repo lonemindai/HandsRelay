@@ -52,7 +52,7 @@ def _unlock(fd):
 def allocate_generation(root):
     """Short lock on the counter only. This is not the output-set lock."""
     path = os.path.join(root, "generation.counter")
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o644)
     try:
         _lock_blocking(fd)
         raw = b""
@@ -81,7 +81,7 @@ def allocate_generation(root):
 def _atomic_bytes(directory, final_name, data, stage, crash_after, hard_crash):
     tmp = os.path.join(directory, f".{final_name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o644)
     except OSError as exc:
         raise PublishError("publish_failed") from exc
     try:
@@ -146,7 +146,7 @@ def _current_generation(root):
 
 def _commit_manifest(root, manifest, crash_after, hard_crash):
     """Move the pointer forward only. A slower publisher must not uncover a deleted generation."""
-    fd = os.open(os.path.join(root, "generation.counter"), os.O_CREAT | os.O_RDWR, 0o644)
+    fd = os.open(os.path.join(root, "generation.counter"), os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o644)
     try:
         _lock_blocking(fd)
         if int(manifest["generation"]) < _current_generation(root):

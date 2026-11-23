@@ -183,6 +183,7 @@ def _try_lock(handle):
         handle.seek(0)
         handle.write(b"\0")
         handle.flush()
+        handle.seek(0)  # lock and unlock must cover the same byte
         try:
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
