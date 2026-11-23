@@ -12,6 +12,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "watchers"))
+import publish as publish_module
 from publish import Incomplete, PublishCrash, publish, read_published
 
 SCRIPTS = {
@@ -130,6 +131,40 @@ def test_w02_unlocked_processes_leave_one_complete_generation(tmp_path, variant)
     got = read_published(tmp_path)
     assert got["meta"]["variant"] == variant
     assert seen == []
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_replace_waits_for_a_reader_on_windows(tmp_path, monkeypatch):
+    real = os.replace
+    calls = []
+
+    def busy_twice(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError(13, "in use")
+        real(src, dst)
+
+    monkeypatch.setattr(publish_module, "_RENAME_CAN_BE_BLOCKED", True)
+    monkeypatch.setattr(publish_module.os, "replace", busy_twice)
+    monkeypatch.setattr(publish_module.time, "sleep", lambda _s: None)
+    publish_module._atomic_bytes(str(tmp_path), "manifest.json", b"new", "manifest", None, False)
+    assert len(calls) == 3
+    assert (tmp_path / "manifest.json").read_bytes() == b"new"
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_replace_that_stays_blocked_fails_without_a_leftover(tmp_path, monkeypatch):
+    (tmp_path / "manifest.json").write_bytes(b"old")
+
+    def blocked(_src, _dst):
+        raise PermissionError(13, "in use")
+
+    monkeypatch.setattr(publish_module, "_RENAME_CAN_BE_BLOCKED", True)
+    monkeypatch.setattr(publish_module.os, "replace", blocked)
+    monkeypatch.setattr(publish_module, "REPLACE_WAIT_S", 0)
+    with pytest.raises(publish_module.PublishError):
+        publish_module._atomic_bytes(str(tmp_path), "manifest.json", b"new", "manifest", None, False)
+    assert (tmp_path / "manifest.json").read_bytes() == b"old"
     assert not list(tmp_path.rglob("*.tmp"))
 
 
