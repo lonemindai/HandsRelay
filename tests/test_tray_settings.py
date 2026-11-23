@@ -77,6 +77,7 @@ def test_defaults_equal_todays_behaviour():
         "paste_auto_min_chars": 120,
         "close_to_tray": False,
         "tray_icon": True,
+        "type_real_keys": False,
     }
     assert rs.changed_from_defaults(d) == {}
 
