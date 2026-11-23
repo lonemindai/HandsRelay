@@ -124,6 +124,27 @@ def _ensure_dpi_aware():
 DPI_AWARENESS = _ensure_dpi_aware()
 
 
+def enter_physical_dpi_thread():
+    """v5 retry: put the calling (request) thread in per-monitor-v2 awareness.
+
+    The process stays system-aware (the Tk window scaling is unchanged), but
+    every input request runs on its own thread, and a thread in per-monitor-v2
+    sees and injects physical pixels on every monitor. This keeps clicks on
+    target when the display scale was changed after logon (process system DPI
+    stays at the logon value) and on monitors whose scale differs from the
+    primary. Returns True if the thread context was switched.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        fn = ctypes.windll.user32.SetThreadDpiAwarenessContext  # type: ignore[attr-defined]
+        fn.restype = ctypes.c_void_p
+        fn.argtypes = [ctypes.c_void_p]
+        return bool(fn(ctypes.c_void_p(-4)))
+    except Exception:
+        return False
+
+
 def dpi_scale_percent():
     """Active system display scale in percent (96 DPI = 100), or None."""
     if os.name != "nt":
@@ -581,6 +602,11 @@ def _auth_decide(provided):
             for p in [p for p, ts in _fail_by_peer.items() if not ts or now - ts[-1] >= FAIL_WINDOW]:
                 del _fail_by_peer[p]
         return "bad", tripped
+
+
+@app.before_request
+def _physical_dpi_for_request():
+    enter_physical_dpi_thread()
 
 
 @app.before_request

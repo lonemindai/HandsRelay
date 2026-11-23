@@ -372,3 +372,35 @@ def test_process_is_dpi_aware_so_coordinates_are_physical_at_any_scale(hands, mo
     monkeypatch.setattr(hands.ctypes, "windll", FakeWindll(), raising=False)
     assert hands._ensure_dpi_aware() == "system" and calls == ["aware"]
     assert hands.dpi_scale_percent() == percent
+
+
+def test_request_thread_enters_per_monitor_v2(hands, monkeypatch):
+    """Retry fix: input requests run in a per-monitor-v2 thread context so clicks stay on
+    target after a live scale change (the process system DPI keeps its logon value)."""
+    seen = []
+
+    class Fn:
+        restype = None
+        argtypes = None
+
+        def __call__(self, ctx):
+            seen.append(getattr(ctx, "value", ctx))
+            return 1234
+
+    class FakeUser32:
+        SetThreadDpiAwarenessContext = Fn()
+
+    class FakeWindll:
+        user32 = FakeUser32()
+
+    monkeypatch.setattr(hands.os, "name", "nt")
+    monkeypatch.setattr(hands.ctypes, "windll", FakeWindll(), raising=False)
+    assert hands.enter_physical_dpi_thread() is True
+    assert seen == [-4]
+    monkeypatch.setattr(hands.os, "name", "posix")
+    assert hands.enter_physical_dpi_thread() is False
+
+
+def test_every_request_runs_the_physical_dpi_hook(hands):
+    names = [f.__name__ for f in hands.app.before_request_funcs.get(None, [])]
+    assert "_physical_dpi_for_request" in names
