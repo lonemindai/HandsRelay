@@ -96,6 +96,15 @@ SETTINGS = (
         source="hands/hands_relay_hands.py _type_dispatch (was the literal 120)",
     ),
     Setting(
+        key="type_real_keys",
+        label="Type with real key presses instead of pasting (for fields that reject paste)",
+        help=("Off (default): long text is pasted, which is fast. On: every character is sent as a real key down "
+              "and key up, nothing touches your clipboard, and it is slower. A request can still choose its own "
+              "method. If you use the keyboard or mouse, typing stops."),
+        kind="bool", default=False, applies="live", group="Typing",
+        source="hands/hands_relay_hands.py _real_keys_default (v5 real-key typing)",
+    ),
+    Setting(
         key="close_to_tray",
         label="Closing the window keeps the relay running in the tray",
         help="Off (today's behaviour): closing the window stops all three services. On: it hides to the tray; use Quit there.",

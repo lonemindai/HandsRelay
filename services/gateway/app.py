@@ -1922,7 +1922,7 @@ def _held_failure_diagnostics(result):
                        "yield", "owner_active", "burst", "claim_held"},
         "abort_reason": {"owner", "locked", "foreground_changed"},
         "owner_guard": {"hook", "dwtime", "none", None},
-        "method_used": {"keys", "paste"},
+        "method_used": {"keys", "paste", "real_keys"},
     }
     for key, allowed in enums.items():
         value = result.get(key)

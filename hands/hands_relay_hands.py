@@ -59,8 +59,10 @@ WINDOW, CLIPBOARD AND INPUT OPERATIONS — same X-Secret gate:
                                         area (see log_line call in the
                                         route), so the operator can see
                                         reads in the app window.
-  POST /type also accepts {method: "auto"|"paste"|"keys"}: long text can
-  go through the clipboard (paste) instead of slow keystrokes.
+  POST /type also accepts {method: "auto"|"paste"|"keys"|"real_keys"}: long
+  text can go through the clipboard (paste) instead of slow keystrokes.
+  "real_keys" (opt-in, v5) sends real key down and key up events per
+  character, no clipboard, for fields that reject paste.
 CAPTURE + INPUT REALISM
   GET /screenshot?monitor=N   capture monitor N (0-based) only
   GET /screenshot?region=x,y,w,h
@@ -96,6 +98,41 @@ import time
 import tkinter as tk
 import urllib.request
 import uuid
+
+
+
+def _ensure_dpi_aware():
+    """v5: make pointer coordinates physical pixels at any display scale.
+
+    A DPI-unaware process gets virtualized coordinates, so at 125% or 150%
+    a click aimed at (x, y) lands at the wrong physical pixel. pyautogui
+    also sets system awareness on import; doing it here first makes the
+    guarantee explicit and reportable. Returns the awareness name.
+    """
+    if os.name != "nt":
+        return "n/a"
+    try:
+        # System awareness, the same level pyautogui sets on import and the
+        # level the Tk app window already runs at. Per-monitor-v2 is not used:
+        # it would change how the Tk window scales.
+        ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
+        return "system"
+    except Exception:
+        return "unknown"
+
+
+DPI_AWARENESS = _ensure_dpi_aware()
+
+
+def dpi_scale_percent():
+    """Active system display scale in percent (96 DPI = 100), or None."""
+    if os.name != "nt":
+        return None
+    try:
+        return round(ctypes.windll.user32.GetDpiForSystem() * 100 / 96)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
 
 import pyautogui
 from flask import Flask, request, jsonify, send_file, has_request_context
@@ -1412,8 +1449,123 @@ def _pre_effect_response(kind):
     return jsonify({"ok": False, "error": error, "error_code": code}), 409
 
 
-def _type_dispatch(method, keys_fn, paste_fn, text):
-    """Pick the type path. Keys fallback only if paste never started."""
+# ---- real key typing (v5) --------------------------------------------------
+# Opt-in typing mode for fields that reject paste. Every character is sent
+# as real key events: key DOWN then key UP through SendInput (a shifted
+# character wraps them in Shift down/up; a character with no key on the
+# active layout goes as a KEYEVENTF_UNICODE down/up pair). Nothing touches
+# the clipboard and nothing falls back to paste. Timing is a fixed 0.02 s
+# per character: no jitter, no random draw (partner rulings 2026-11-22).
+# Default stays relay speed ("auto": paste long text, keys otherwise).
+REAL_KEYS_DELAY_S = 0.02
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+_VK_SHIFT, _VK_CONTROL, _VK_MENU = 0x10, 0x11, 0x12
+_VK_RETURN, _VK_TAB = 0x0D, 0x09
+
+
+def _real_keys_default():
+    """Session-wide switch (settings key type_real_keys, env HANDS_REAL_KEYS):
+    when on, method "auto" types with real keys instead of pasting. An
+    explicit request method still wins."""
+    return _flag("HANDS_REAL_KEYS", "real_keys", False)
+
+
+def _vk_for_char(ch):
+    """(vk, shift_state) from the active layout, or None. Seam for tests."""
+    if os.name != "nt":
+        return None
+    res = ctypes.windll.user32.VkKeyScanW(ch)  # type: ignore[attr-defined]
+    res &= 0xFFFF
+    if res == 0xFFFF:
+        return None
+    return res & 0xFF, (res >> 8) & 0xFF
+
+
+def _real_key_events(ch):
+    """Plan the key events for one character: [(vk, scan, flags)].
+
+    Pure given _vk_for_char. Every down has its matching up (modifier ups
+    run in reverse order).
+    """
+    if ch == "\n" or ch == "\r":
+        return [(_VK_RETURN, 0, 0), (_VK_RETURN, 0, _KEYEVENTF_KEYUP)]
+    if ch == "\t":
+        return [(_VK_TAB, 0, 0), (_VK_TAB, 0, _KEYEVENTF_KEYUP)]
+    mapped = _vk_for_char(ch)
+    if mapped is not None:
+        vk, state = mapped
+        mods = []
+        if state & 1:
+            mods.append(_VK_SHIFT)
+        if state & 2:
+            mods.append(_VK_CONTROL)
+        if state & 4:
+            mods.append(_VK_MENU)
+        events = [(m, 0, 0) for m in mods]
+        events.append((vk, 0, 0))
+        events.append((vk, 0, _KEYEVENTF_KEYUP))
+        events += [(m, 0, _KEYEVENTF_KEYUP) for m in reversed(mods)]
+        return events
+    data = ch.encode("utf-16-le")
+    events = []
+    for i in range(0, len(data), 2):
+        unit = int.from_bytes(data[i:i + 2], "little")
+        events.append((0, unit, _KEYEVENTF_UNICODE))
+        events.append((0, unit, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP))
+    return events
+
+
+def _send_key_events(events):
+    """Send one batch of key events through SendInput. Seam for tests.
+
+    Raises unless every event was accepted (a short count means the
+    desktop refused part of the batch, e.g. UIPI or a secure desktop).
+    """
+    if os.name != "nt":
+        raise RuntimeError("real key typing needs Windows")
+
+    class _KI(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _MI(ctypes.Structure):
+        _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                    ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _U(ctypes.Union):
+        _fields_ = [("ki", _KI), ("mi", _MI)]
+
+    class _INPUT_T(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("u", _U)]
+
+    arr = (_INPUT_T * len(events))()
+    for i, (vk, scan, flags) in enumerate(events):
+        arr[i].type = 1  # INPUT_KEYBOARD
+        arr[i].u.ki = _KI(vk, scan, flags, 0, 0)
+    sent = ctypes.windll.user32.SendInput(  # type: ignore[attr-defined]
+        len(events), arr, ctypes.sizeof(_INPUT_T))
+    if sent != len(events):
+        raise RuntimeError(f"SendInput accepted {sent} of {len(events)} key events")
+
+
+_SEND_KEY_EVENTS_NATIVE = _send_key_events
+
+
+def _real_key_write(ch):
+    """Type one character as real key down + key up events."""
+    _send_key_events(_real_key_events(ch))  # module global: tests patch the seam
+
+
+def _type_dispatch(method, keys_fn, paste_fn, text, real_keys_fn=None):
+    """Pick the type path. Keys fallback only if paste never started.
+
+    "real_keys" never pastes and never falls back to paste or pyautogui.
+    """
+    if method == "real_keys":
+        return real_keys_fn(), None
     if method == "keys":
         return keys_fn(), None
     wants_paste = method == "paste" or (
@@ -1452,8 +1604,13 @@ def type_text():
     if not isinstance(text, str):
         return jsonify({"ok": False, "error": "text must be a string"}), 400
     method = d.get("method", "auto")
-    if method not in ("auto", "paste", "keys"):
-        return jsonify({"ok": False, "error": "method must be auto, paste or keys"}), 400
+    if method not in ("auto", "paste", "keys", "real_keys"):
+        return jsonify({"ok": False, "error": "method must be auto, paste, keys or real_keys"}), 400
+    if method == "auto" and _real_keys_default():
+        method = "real_keys"
+    if method == "real_keys" and os.name != "nt" and _send_key_events is _SEND_KEY_EVENTS_NATIVE:
+        return jsonify({"ok": False, "error": "real key typing needs Windows",
+                        "error_code": "real_keys_unavailable"}), 501
     jitter = bool(d.get("jitter", True))
     _owner_monitor.ensure_started()
     started = time.monotonic()
@@ -1481,9 +1638,16 @@ def type_text():
         else:
             state["reason"] = kind
 
-    def _keys():
+    def _real_keys():
+        return _keys(real=True)
+
+    def _keys(real=False):
         nonlocal delays, typed
-        delays = _plan_key_delays(text, random) if jitter else [0.02] * len(text)
+        if real:
+            delays = [REAL_KEYS_DELAY_S] * len(text)
+        else:
+            delays = _plan_key_delays(text, random) if jitter else [0.02] * len(text)
+        write = _real_key_write if real else pyautogui.write
         guard = _TypeOwnerGuard()
         state["guard"] = guard.mode
         for ch, delay in zip(text, delays):
@@ -1492,7 +1656,7 @@ def type_text():
                 _remember_block(kind, focus)
                 break
             try:
-                _inject(pyautogui.write, ch)
+                _inject(write, ch)
             except _InputRefused as exc:
                 if typed == 0:
                     state["pre_effect"] = exc.response
@@ -1507,7 +1671,7 @@ def type_text():
             time.sleep(delay)
             typed += 1
         state["guard"] = guard.mode
-        return "keys"
+        return "real_keys" if real else "keys"
 
     def _paste():
         nonlocal typed
@@ -1598,7 +1762,7 @@ def type_text():
 
     try:
         with _input("keys"):
-            method_used, note = _type_dispatch(method, _keys, _paste, text)
+            method_used, note = _type_dispatch(method, _keys, _paste, text, real_keys_fn=_real_keys)
     except _PasteUncertain as exc:
         return jsonify({
             "ok": False,
@@ -1613,7 +1777,7 @@ def type_text():
 
     if state["pre_effect"] is not None and typed == 0:
         return state["pre_effect"]
-    if method_used == "keys" and typed < len(text):
+    if method_used in ("keys", "real_keys") and typed < len(text):
         reason = state["reason"] or "owner"
         if reason == "locked":
             error = f"desktop locked — typing aborted at char {typed}"
@@ -1630,7 +1794,7 @@ def type_text():
             "aborted": True,
             "chars_typed": typed,
             "chars": len(text),
-            "method_used": "keys",
+            "method_used": method_used,
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "delays_planned": len(delays),
             "planned_seconds": sum(delays[:typed]),

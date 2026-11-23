@@ -1000,6 +1000,9 @@ class RelayApp:
                 gw.set_agent_browser(values["agent_browser_invisible"])
             if "browser_dom_adapter" in values and hasattr(gw, "set_dom_adapter"):
                 gw.set_dom_adapter(values["browser_dom_adapter"])
+        if "type_real_keys" in values:
+            # The hands read this per /type call, so it is live.
+            os.environ["HANDS_REAL_KEYS"] = "1" if values["type_real_keys"] else "0"
         hands = self._hands_module
         if hands is not None and "paste_auto_min_chars" in values:
             hands.PASTE_AUTO_MIN_CHARS = values["paste_auto_min_chars"]
