@@ -396,7 +396,7 @@ def test_request_thread_enters_per_monitor_v2(hands, monkeypatch):
     monkeypatch.setattr(hands.os, "name", "nt")
     monkeypatch.setattr(hands.ctypes, "windll", FakeWindll(), raising=False)
     assert hands.enter_physical_dpi_thread() is True
-    assert seen == [-4]
+    assert [v - (1 << 64) if v > 0 else v for v in seen] == [-4]
     monkeypatch.setattr(hands.os, "name", "posix")
     assert hands.enter_physical_dpi_thread() is False
 
