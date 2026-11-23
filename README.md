@@ -20,7 +20,7 @@ v5 adds two input changes on top of v4. Default typing behavior is unchanged.
 
 - **Real-key typing (opt-in).** `POST /type` accepts `method: "real_keys"`, for fields that reject paste. Each character is sent through Windows `SendInput` as a real key down and key up, with Shift wrapped around shifted characters and a Unicode down/up pair for characters that have no key on the active layout. It never touches the clipboard and never falls back to paste. Timing is a fixed 0.02 s per character, with no jitter. Off Windows the method answers `501 real_keys_unavailable`.
 - **Session-wide switch.** The Settings entry "Type with real key presses instead of pasting" (`type_real_keys`, off by default; environment variable `HANDS_REAL_KEYS`) makes `method: "auto"` use real keys. A method named in the request still wins.
-- **Owner input still wins.** Keyboard or mouse input from the person at the PC, a locked desktop, or a changed foreground window stops real-key typing. If nothing was typed yet, the request is refused with a 409. If typing had started, the response reports `type_aborted` and `chars_typed`.
+- **Owner input still wins.** Keyboard or mouse input from the person at the PC or a locked desktop stops real-key typing. A changed foreground window stops it only when the request carries `expect_focus`, which queued acts pin automatically. A direct `POST /type` or `POST /v1/act` without `expect_focus` keeps typing into whichever window now has focus and returns 200. When typing is stopped before the first character, the request is refused with a 409. If typing had started, the response reports `type_aborted` and `chars_typed`.
 - **Clicks land on scaled displays.** The hands process is now explicitly DPI-aware, and each input request thread runs per-monitor-v2, so request coordinates are physical pixels on every monitor. This corrects clicks that missed their target when a monitor was set to 125% or 150% after logon. Screenshot routes use the same physical pixels.
 
 The executable, the autostart entry and `start-v4.bat` keep their `v4` names in this release, so the build still produces `HandsRelay v4.exe`.
@@ -429,7 +429,7 @@ backend exists: the current clipboard is saved, replaced with the text,
 pasted with Ctrl+V, then restored. Any clipboard failure falls back to
 keystrokes rather than failing, and the response reports what happened:
 `{"ok": true, "method_used": "paste"|"keys"|"real_keys", "chars": n,
-"elapsed_seconds": x}`. Paste responses also report `owner_guard`. Before injection, owner input, locking, or a changed foreground refuses the paste; after injection, a takeover reports `chars_typed` and `type_aborted` without replay. A paste already sent cannot be retracted. Queued owner aborts settle as `aborted-owner`, not as a relay failure. On the gateway, the act timeout for `type` is
+"elapsed_seconds": x}`. Paste responses also report `owner_guard`. Before injection, owner input or locking refuses the paste, and so does a changed foreground when the request carries `expect_focus`; after injection, a takeover reports `chars_typed` and `type_aborted` without replay. A paste already sent cannot be retracted. Queued owner aborts settle as `aborted-owner`, not as a relay failure. On the gateway, the act timeout for `type` is
 sized to the payload — `max(30, min(600, 15 + len(text)/6))` seconds,
 since the keystroke path runs at worst ~6 chars/s — while every other
 op keeps the flat 30 s.
