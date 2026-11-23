@@ -26,6 +26,12 @@ jobs:
         run: python -m pip install flask waitress requests pillow pytest
       - name: Run every suite, one process each
         run: python tools/run_all_tests.py
+      - name: Show the byte-for-byte guards ran
+        shell: bash
+        run: |
+          python -m pytest -v tests/test_uia_tree.py::test_hands_off_is_byte_for_byte_the_base tests/test_uia_tree.py::test_gateway_off_is_byte_for_byte_the_base
+          python -m pytest -v tests/test_agent_browser.py::test_off_is_byte_for_byte_the_base_gateway
+          python -m pytest -v tests/test_dom_adapter.py::test_off_is_byte_for_byte_the_old_gateway
 
   windows:
     # The Windows job passed at the previous merge; failures now block CI.
@@ -41,3 +47,9 @@ jobs:
         run: python -m pip install flask waitress requests pillow pytest
       - name: Run every suite, one process each
         run: python tools/run_all_tests.py
+      - name: Show the byte-for-byte guards ran
+        shell: bash
+        run: |
+          python -m pytest -v tests/test_uia_tree.py::test_hands_off_is_byte_for_byte_the_base tests/test_uia_tree.py::test_gateway_off_is_byte_for_byte_the_base
+          python -m pytest -v tests/test_agent_browser.py::test_off_is_byte_for_byte_the_base_gateway
+          python -m pytest -v tests/test_dom_adapter.py::test_off_is_byte_for_byte_the_old_gateway

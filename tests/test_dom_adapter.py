@@ -21,6 +21,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+from base_fixtures import base_bytes
+
 BASE_COMMIT = "1b585ac"  # v4-rc1 just before the DOM merge (wave 1 + nested + uia): the gateway without the adapter
 _seq = itertools.count()
 
@@ -290,12 +292,8 @@ def test_off_every_dom_route_refuses_clearly(monkeypatch, browser):
 
 def test_off_is_byte_for_byte_the_old_gateway(monkeypatch, tmp_path):
     """Every non-DOM route answers exactly what the pre-adapter gateway did."""
-    old_src = subprocess.run(["git", "-C", str(ROOT), "show", f"{BASE_COMMIT}:services/gateway/app.py"],
-                             capture_output=True, text=True)
-    if old_src.returncode != 0:
-        pytest.skip("base commit not available in this checkout")
     old_path = tmp_path / "app_old.py"
-    old_path.write_text(old_src.stdout)
+    old_path.write_bytes(base_bytes(BASE_COMMIT, "services/gateway/app.py"))
     import requests
     import time as _time
 

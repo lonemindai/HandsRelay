@@ -93,13 +93,16 @@ def test_nonjitter_and_jitter_stop_on_the_same_character(hands, monkeypatch):
 def test_focus_change_after_a_character_keeps_the_prefix(hands, monkeypatch):
     written = []
     windows = [{"title": "Kept", "focused": True}]
-    monkeypatch.setattr(hands, "_enum_windows", lambda: list(windows))
+    # The native lookup runs first on Windows, so stub it on every host.
+    monkeypatch.setattr(hands, "_foreground_window_native",
+                        lambda: next(w for w in windows if w["focused"]))
     monkeypatch.setattr(hands, "_owner_input_snapshot", lambda: (0, 1))
 
     def write(ch, **_k):
         written.append(ch)
         if len(written) == 2:
             windows[0]["focused"] = False
+            windows.append({"title": "Other", "focused": True})
 
     monkeypatch.setattr(hands.pyautogui, "write", write)
     response = post(hands, {"text": "abcdef", "method": "keys", "expect_focus": "Kept"})
