@@ -71,7 +71,7 @@ def _env_float(name, default):
 
 
 def append_log(path, line):
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
     try:
         os.write(fd, line.encode("utf-8"))
         os.fsync(fd)

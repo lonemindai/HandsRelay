@@ -7,7 +7,11 @@ Cleanup removes directories the current manifest does not name.
 import hashlib
 import json
 import os
+import time
 import uuid
+
+REPLACE_WAIT_S = 2.0
+_RENAME_CAN_BE_BLOCKED = os.name == "nt"
 
 
 class Incomplete(Exception):
@@ -52,7 +56,7 @@ def _unlock(fd):
 def allocate_generation(root):
     """Short lock on the counter only. This is not the output-set lock."""
     path = os.path.join(root, "generation.counter")
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o644)
     try:
         _lock_blocking(fd)
         raw = b""
@@ -78,10 +82,24 @@ def allocate_generation(root):
             os.close(fd)
 
 
+def _replace(source, target):
+    """Windows refuses a rename while a reader has the target open. Readers
+    hold it briefly, so wait for them instead of failing the publish."""
+    deadline = time.monotonic() + REPLACE_WAIT_S
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if not _RENAME_CAN_BE_BLOCKED or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 def _atomic_bytes(directory, final_name, data, stage, crash_after, hard_crash):
     tmp = os.path.join(directory, f".{final_name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o644)
     except OSError as exc:
         raise PublishError("publish_failed") from exc
     try:
@@ -98,7 +116,14 @@ def _atomic_bytes(directory, final_name, data, stage, crash_after, hard_crash):
             raise PublishError("disk_full") from exc
         raise PublishError("publish_failed") from exc
     os.close(fd)
-    os.replace(tmp, os.path.join(directory, final_name))
+    try:
+        _replace(tmp, os.path.join(directory, final_name))
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise PublishError("publish_failed") from exc
     if crash_after == stage:
         if hard_crash:
             os._exit(86)
@@ -146,7 +171,7 @@ def _current_generation(root):
 
 def _commit_manifest(root, manifest, crash_after, hard_crash):
     """Move the pointer forward only. A slower publisher must not uncover a deleted generation."""
-    fd = os.open(os.path.join(root, "generation.counter"), os.O_CREAT | os.O_RDWR, 0o644)
+    fd = os.open(os.path.join(root, "generation.counter"), os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o644)
     try:
         _lock_blocking(fd)
         if int(manifest["generation"]) < _current_generation(root):

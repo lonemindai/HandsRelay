@@ -18,7 +18,9 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE = "925f9be"  # v4-toggles-wave1 head, before the agent browser
+from base_fixtures import base_bytes
+
+BASE = "e755d66"  # v4-toggles-wave1 head, before the agent browser
 _seq = itertools.count()
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
 
@@ -310,12 +312,8 @@ def test_off_every_route_is_404_like_unknown(monkeypatch):
 
 
 def test_off_is_byte_for_byte_the_base_gateway(monkeypatch, tmp_path):
-    old = subprocess.run(["git", "-C", str(ROOT), "show", f"{BASE}:services/gateway/app.py"],
-                         capture_output=True, text=True)
-    if old.returncode != 0:
-        pytest.skip("base commit not available in this checkout")
     old_path = tmp_path / "app_old.py"
-    old_path.write_text(old.stdout)
+    old_path.write_bytes(base_bytes(BASE, "services/gateway/app.py"))
     import requests
     import time as _time
 
